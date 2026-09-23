@@ -1,0 +1,15 @@
+.env
+.venv/
+.venv-intel/
+data/
+data
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pt
+node_modules/
+.wrangler/
+.DS_Store
+static/court.png
+scripts/com.duprvision.public.plist
+cloudflare/wrangler.jsonc

@@ -1,0 +1,10 @@
+{
+  "name": "pickle",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-09-22",
+  "workers_dev": true,
+  "preview_urls": false,
+  "vars": {
+    "ORIGIN_URL": "https://replace-me.trycloudflare.com"
+  }
+}
