@@ -1,5 +1,6 @@
 """Structured video review. External processing is opt-in, never a fallback."""
 import base64
+import hashlib
 import json
 import os
 import re
@@ -69,7 +70,7 @@ class Review(BaseModel):
 
 
 def provider_schema(schema_model=Review):
-    """Keep generation grammar small; enforce all bounds locally with Review."""
+    """Keep the generation grammar small; enforce bounds with local validation."""
     local_only = {"title", "minLength", "maxLength", "exclusiveMinimum", "minItems", "maxItems", "minimum", "maximum"}
 
     def simplify(value):
@@ -182,7 +183,33 @@ shot/rally observation under 240 characters, and rating rationale under 400 char
 Return at most 150 shots and 50 rallies; include only events you actually observed."""
 
 
-def gemini_review(row, selection, external_consent):
+class ReviewError(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+class RetryableReviewError(ReviewError):
+    def __init__(self, code, delay=30):
+        super().__init__(code, "The video service is busy. Your clip is saved for another attempt.")
+        self.delay = delay
+
+
+def cache_key(db, video_id, selection, model, marked=False):
+    from .performance import PROMPT, CompactReview, validate_performance
+    import inspect
+    source = db.execute("SELECT user_id,sha256 FROM videos JOIN video_fingerprints ON id=video_id WHERE id=?", (video_id,)).fetchone()
+    if not source:
+        return None
+    # The account, exact player selection, prompt, schema, and rubric define reuse.
+    material = [*source, dict(selection), model, "silent-video-5fps-400k-v2", bool(marked),
+                "yolo26n-detect-bytetrack-5hz-v1" if marked else "", PROMPT,
+                CompactReview.model_json_schema(), inspect.getsource(validate_performance)]
+    material[2].pop("video_id", None)
+    return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+
+
+def gemini_review(row, selection, external_consent, marked_reference=None):
     if configured_engine() != "gemini" or not external_consent:
         raise RuntimeError("External video processing has not been authorized")
     with connect() as db:
@@ -191,18 +218,30 @@ def gemini_review(row, selection, external_consent):
         return json.loads(cached[0])
     key = os.getenv("GEMINI_API_KEY", "")
     if not key:
-        raise RuntimeError("Video review is not configured by the owner")
+        raise ReviewError("CONFIGURATION", "Video review is not configured by the owner")
     model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    with connect(immediate=True) as db:
+        db.execute("INSERT OR IGNORE INTO analysis_jobs(video_id,model) VALUES (?,?)", (row["id"], model))
+        model = db.execute("SELECT model FROM analysis_jobs WHERE video_id=?", (row["id"],)).fetchone()[0]
+        fingerprint = cache_key(db, row["id"], selection, model, marked_reference is not None)
+        if fingerprint:
+            cached = db.execute("SELECT a.result_json FROM review_cache_keys k JOIN videos v ON v.id=k.video_id JOIN analyses a ON a.video_id=v.id WHERE k.cache_key=? AND v.status='COMPLETED' LIMIT 1", (fingerprint,)).fetchone()
+            db.execute("INSERT OR REPLACE INTO review_cache_keys VALUES (?,?)", (row["id"], fingerprint))
+            if cached:
+                result = json.loads(cached[0])
+                result.update(cache_hit=True, analysis_seconds=0, usage={})
+                db.execute("INSERT OR REPLACE INTO provider_results VALUES (?,?)", (row["id"], json.dumps(result)))
+                return result
     if model not in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"):
-        raise RuntimeError("Select a supported cost-limited video review model")
+        raise ReviewError("CONFIGURATION", "Select a supported cost-limited video review model")
     output = video_dir(row["id"]) / "review.mp4"
     try:
-        return _request_review(row, selection, key, model, output)
+        return _request_review(row, selection, key, model, output, marked_reference)
     finally:
         output.unlink(missing_ok=True)
 
 
-def _request_review(row, selection, key, model, output):
+def _request_review(row, selection, key, model, output, marked_reference=None):
     from .performance import CompactReview, PROMPT as compact_prompt, validate_performance
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", row["normalized_path"],
                     "-vf", "fps=5", "-an", "-c:v", "libx264", "-threads", "1", "-preset", "veryfast", "-b:v", "400k",
@@ -212,68 +251,72 @@ def _request_review(row, selection, key, model, output):
         raise RuntimeError("Review video exceeded the processing size limit")
     previews = (.1, .4, .7)
     number = min(range(3), key=lambda i: abs(row["duration_seconds"] * previews[i] - selection["timestamp_seconds"])) + 1
-    reference = video_dir(row["id"]) / f"preview-{number}.jpg"
+    reference = marked_reference or video_dir(row["id"]) / f"preview-{number}.jpg"
     prompt = compact_prompt + f"\nDuration: {row['duration_seconds']:.1f}s. Reference timestamp: {selection['timestamp_seconds']:.1f}s. Player point: x={selection['x']:.3f}, y={selection['y']:.3f} (0-1 from top-left)."
+    if marked_reference is not None:
+        prompt += "\nThe green outline in the reference frame marks the locally tracked selected player. Use the video, not the outline, to judge shots and outcomes."
     payload = {"contents":[{"role":"user","parts":[{"text":prompt},
         {"inlineData":{"mimeType":"image/jpeg","data":base64.b64encode(reference.read_bytes()).decode()}},
         {"inlineData":{"mimeType":"video/mp4","data":base64.b64encode(output.read_bytes()).decode()}, "videoMetadata":{"fps":5}}]}],
         "generationConfig":{"temperature":1 if model.startswith("gemini-3") else .1,"maxOutputTokens":4096,"responseMimeType":"application/json",
                             "responseJsonSchema":provider_schema(CompactReview),"thinkingConfig":{"thinkingLevel":"minimal" if "flash-lite" in model else "low"} if model.startswith("gemini-3") else {"thinkingBudget":0}}}
     started = time.monotonic()
-    primary_model = model
-    for attempt in range(3):
-        if time.monotonic()-started >= 90:
-            break
-        model = primary_model
-        if attempt == 1 and primary_model in ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite"):
-            model = "gemini-3.5-flash-lite" if primary_model == "gemini-3.1-flash-lite" else "gemini-3.1-flash-lite"
-        request_id = reserve_request(row["id"], model)
-        response = None
+    # A worker invocation makes exactly one paid request. SQLite schedules recovery.
+    request_id = reserve_request(row["id"], model)
+    response = None
+    try:
+        timeout = max(10, min(120, float(os.getenv("GEMINI_READ_TIMEOUT", "60"))))
+        with httpx.Client(timeout=httpx.Timeout(timeout, connect=8, write=15, pool=5), follow_redirects=False) as client:
+            response = client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                                   headers={"x-goog-api-key":key}, json=payload)
+        if response.status_code != 200:
+            code = f"HTTP_{response.status_code}"
+            if response.status_code not in (408, 429, 500, 502, 503, 504):
+                raise ReviewError(code, "Video provider configuration needs attention. Contact the owner.")
+            raise RetryableReviewError(code, retry_delay(response))
+        body = response.json()
+        candidate = body.get("candidates", [{}])[0]
+        finish = candidate.get("finishReason")
+        if body.get("promptFeedback", {}).get("blockReason") or finish in ("SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"):
+            raise ReviewError("CONTENT_BLOCKED", "The provider could not review this recording. Try a different gameplay clip.")
+        if finish != "STOP":
+            raise RetryableReviewError("INCOMPLETE_RESPONSE")
+        raw = json.loads("".join(p.get("text", "") for p in candidate.get("content", {}).get("parts", []) if not p.get("thought")))
         try:
-            remaining = min(35, max(1, 90-(time.monotonic()-started)))
-            with httpx.Client(timeout=httpx.Timeout(remaining, connect=8, write=15, pool=5), follow_redirects=False) as client:
-                response = client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                                       headers={"x-goog-api-key":key},json=payload)
-            if response.status_code == 200:
-                body = response.json()
-                candidate = body.get("candidates", [{}])[0]
-                if candidate.get("finishReason") != "STOP":
-                    raise ValueError("Incomplete response")
-                raw = json.loads("".join(p.get("text", "") for p in candidate.get("content", {}).get("parts", []) if not p.get("thought")))
-                result = validate_performance(raw, row["duration_seconds"])
-                result.update(model=model, usage=body.get("usageMetadata", {}),
-                              analysis_seconds=round(time.monotonic()-started,1))
-                with connect() as db:
-                    db.execute("INSERT OR REPLACE INTO provider_results VALUES (?,?)", (row["id"],json.dumps(result)))
-                    db.execute("UPDATE provider_requests SET status='succeeded' WHERE id=?", (request_id,))
-                return result
-            if response.status_code not in (408,429,500,502,503,504):
-                finish_request(request_id, "permanent", f"HTTP_{response.status_code}")
-                raise RuntimeError("Video provider configuration needs attention. Contact the owner.")
-            finish_request(request_id, "retryable", f"HTTP_{response.status_code}")
-        except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
-            # Unknown outcomes can cost tokens twice; every retry consumes the same strict budget.
-            finish_request(request_id, "retryable", type(exc).__name__)
-        except RuntimeError:
-            finish_request(request_id, "permanent")
-            raise
-        delay = 2**attempt + random.uniform(0,.5)
-        if response is not None:
-            try:
-                delay = max(delay, float(response.headers.get("retry-after", "0")))
-            except ValueError:
-                try:
-                    retry_at = parsedate_to_datetime(response.headers.get("retry-after", ""))
-                    delay = max(delay,(retry_at-datetime.now(timezone.utc)).total_seconds())
-                except (ValueError, TypeError, OverflowError):
-                    pass
-        if attempt == 2 or delay > 10 or time.monotonic()-started+delay >= 90:
-            break
+            result = validate_performance(raw, row["duration_seconds"])
+        except RuntimeError as exc:
+            raise ReviewError("PLAYER_UNCLEAR", str(exc)) from exc
+        result.update(model=model, usage=body.get("usageMetadata", {}), analysis_seconds=round(time.monotonic()-started, 1))
         with connect() as db:
-            db.execute("UPDATE videos SET stage=?,updated_at=? WHERE id=?",
-                       (f"Provider busy; retrying ({attempt+2}/3)",iso(),row["id"]))
-        time.sleep(delay)
-    raise RuntimeError("The video service is busy. Your clip is saved; try again shortly without uploading again.")
+            db.execute("INSERT OR REPLACE INTO provider_results VALUES (?,?)", (row["id"], json.dumps(result)))
+            db.execute("UPDATE provider_requests SET status='succeeded' WHERE id=?", (request_id,))
+        return result
+    except RetryableReviewError as exc:
+        finish_request(request_id, "retryable", exc.code)
+        raise
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+        code = type(exc).__name__ if isinstance(exc, httpx.HTTPError) else "INVALID_RESPONSE"
+        finish_request(request_id, "retryable", code)
+        raise RetryableReviewError(code) from exc
+    except ReviewError as exc:
+        finish_request(request_id, "permanent", exc.code)
+        raise
+    finally:
+        with connect() as db:
+            db.execute("UPDATE provider_requests SET elapsed_seconds=? WHERE id=?", (time.monotonic()-started, request_id))
+
+
+def retry_delay(response):
+    delay = 30 + random.uniform(0, 5)
+    value = response.headers.get("retry-after", "0")
+    try:
+        delay = max(delay, float(value))
+    except ValueError:
+        try:
+            delay = max(delay, (parsedate_to_datetime(value)-datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return min(delay, 86400)
 
 
 def reserve_request(video_id, model):
@@ -282,10 +325,10 @@ def reserve_request(video_id, model):
         if db.execute("SELECT 1 FROM provider_requests WHERE video_id=? AND status IN ('inflight','succeeded')", (video_id,)).fetchone():
             raise RuntimeError("This clip already has an active or completed review")
         if db.execute("SELECT COUNT(*) FROM provider_requests WHERE video_id=?", (video_id,)).fetchone()[0] >= 6:
-            raise RuntimeError("This clip reached its retry limit. Contact the owner.")
+            raise ReviewError("ATTEMPT_LIMIT", "This clip reached its retry limit. Contact the owner.")
         count = db.execute("SELECT COUNT(*) FROM provider_requests WHERE created_at>=? AND created_at<?", (start,end)).fetchone()[0]
         if count >= int(os.getenv("MAX_DAILY_VIDEO_REVIEWS", "20")):
-            raise RuntimeError("Today's video-review budget is exhausted. Try again tomorrow.")
+            raise ReviewError("DAILY_BUDGET", "Today's video-review budget is exhausted. Try again tomorrow.")
         return db.execute("INSERT INTO provider_requests(video_id,model,created_at,status) VALUES (?,?,?,'inflight')",
                           (video_id,model,iso())).lastrowid
 

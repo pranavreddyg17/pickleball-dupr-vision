@@ -73,6 +73,7 @@ def connect(immediate=False):
 def init_db():
     (DATA / "tmp").mkdir(parents=True, exist_ok=True)
     (DATA / "uploads").mkdir(parents=True, exist_ok=True)
+    (DATA / "evidence").mkdir(parents=True, exist_ok=True)
     with connect() as db:
         db.executescript("""
         PRAGMA journal_mode=WAL;
@@ -120,6 +121,10 @@ def init_db():
           video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
           engine TEXT NOT NULL, external_consent INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS evidence_preferences (
+          video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+          enabled INTEGER NOT NULL CHECK(enabled IN (0,1))
+        );
         CREATE TABLE IF NOT EXISTS provider_attempts (
           video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
           model TEXT NOT NULL, created_at TEXT NOT NULL
@@ -135,6 +140,34 @@ def init_db():
           video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
           result_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS analysis_jobs (
+          video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+          model TEXT NOT NULL, next_attempt_at TEXT, failure_code TEXT,
+          automatic_retries INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS provider_health (
+          name TEXT PRIMARY KEY, cooldown_until TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS video_fingerprints (
+          video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+          sha256 TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS review_cache_keys (
+          video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+          cache_key TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS review_cache_lookup ON review_cache_keys(cache_key);
+        CREATE TABLE IF NOT EXISTS session_notes (
+          video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+          note TEXT NOT NULL DEFAULT '', feedback TEXT CHECK(feedback IN ('helpful','inaccurate')),
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS report_issues (
+          video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+          reason TEXT NOT NULL CHECK(reason IN ('player','shot','missed','other')),
+          detail TEXT NOT NULL DEFAULT '', timestamp_seconds REAL,
+          created_at TEXT NOT NULL
+        );
         INSERT INTO provider_requests(video_id,model,created_at,status)
           SELECT video_id,model,created_at,'legacy' FROM provider_attempts old
           WHERE NOT EXISTS (SELECT 1 FROM provider_requests new WHERE new.video_id=old.video_id);
@@ -143,6 +176,11 @@ def init_db():
         columns = {row[1] for row in db.execute("PRAGMA table_info(provider_requests)")}
         if "failure_code" not in columns:
             db.execute("ALTER TABLE provider_requests ADD COLUMN failure_code TEXT")
+        if "elapsed_seconds" not in columns:
+            db.execute("ALTER TABLE provider_requests ADD COLUMN elapsed_seconds REAL")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(evidence_preferences)")}
+        if "keep_clips" not in columns:
+            db.execute("ALTER TABLE evidence_preferences ADD COLUMN keep_clips INTEGER NOT NULL DEFAULT 0")
 
 
 def hash_token(token):
@@ -245,6 +283,10 @@ def video_dir(video_id):
     return DATA / "uploads" / video_id
 
 
+def evidence_dir(video_id):
+    return DATA / "evidence" / video_id
+
+
 def expire_media(video_id):
     folder = video_dir(video_id)
     if folder.exists():
@@ -258,10 +300,13 @@ def cleanup_media():
     with connect(immediate=True) as db:
         db.execute("""UPDATE videos SET status='EXPIRED', stage='Clip expired',
           error='The upload expired before analysis. Upload a new clip.', updated_at=?
-          WHERE status IN ('WAITING_FOR_PLAYER','FAILED') AND updated_at<?""", (iso(), cutoff))
+          WHERE status IN ('WAITING_FOR_PLAYER','FAILED','RETRY_WAIT') AND updated_at<?""", (iso(), cutoff))
         ids = [row[0] for row in db.execute("SELECT id FROM videos WHERE status IN ('COMPLETED','DELETED','EXPIRED')")]
+        evidence_expired = [row[0] for row in db.execute("SELECT id FROM videos WHERE status IN ('DELETED','EXPIRED','FAILED')")]
     for video_id in ids:
         expire_media(video_id)
+    for video_id in evidence_expired:
+        shutil.rmtree(evidence_dir(video_id), ignore_errors=True)
 
 
 def cleanup_tmp():

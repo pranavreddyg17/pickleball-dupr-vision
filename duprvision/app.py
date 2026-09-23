@@ -1,5 +1,6 @@
 import asyncio
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -8,17 +9,19 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
+from typing import Literal
 
 from argon2.exceptions import VerifyMismatchError
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from .review import configured_engine
+from .progress import progress_history
 
 from .core import (
     COOKIE, DATA, DB, MAX_DURATION, MAX_SIZE, MAX_UPLOADS,
     PASSWORD_HASHER, ROOT, aggregate, cleanup_media, cleanup_tmp, connect, create_session,
-    hash_token, init_db, iso, now, public_video, quota, score_history, user_for_token, video_dir,
+    evidence_dir, hash_token, init_db, iso, now, public_video, quota, score_history, user_for_token, video_dir,
 )
 
 
@@ -47,11 +50,31 @@ class Selection(BaseModel):
     y: float = Field(ge=0, le=1)
     consent: bool
     external_consent: bool = False
+    save_evidence: bool = False
+    save_clips: bool = False
 
 
 class ProfileSettings(BaseModel):
     display_name: str = Field(min_length=1, max_length=80)
     discoverable: bool
+
+
+class SessionNotes(BaseModel):
+    note: str = Field(default='', max_length=1000)
+    feedback: Literal['helpful', 'inaccurate'] | None = None
+
+
+class ReportIssue(BaseModel):
+    reason: Literal['player', 'shot', 'missed', 'other']
+    detail: str = Field(default='', max_length=500)
+    timestamp_seconds: float | None = Field(default=None, ge=0)
+
+
+@app.get('/api/progress')
+def progress(request: Request):
+    user = require_user(request)
+    with connect() as db:
+        return progress_history(db, user['id'])
 
 
 def require_user(request):
@@ -185,17 +208,25 @@ def player_summary(db, target_id, viewer_id, include_history=False):
               "following": db.execute("SELECT COUNT(*) FROM follows WHERE follower_id=?", (target_id,)).fetchone()[0]}
     if include_history:
         result["history"] = history
+    if target_id == viewer_id:
+        result['connections'] = db.execute("""SELECT COUNT(*) FROM users u JOIN profile_settings p ON p.user_id=u.id
+            WHERE p.discoverable=1 AND u.id!=? AND EXISTS(SELECT 1 FROM follows f
+            WHERE (f.follower_id=? AND f.followed_id=u.id) OR (f.followed_id=? AND f.follower_id=u.id))""",
+            (viewer_id, viewer_id, viewer_id)).fetchone()[0]
     return result
 
 
 @app.get("/api/players")
 def players(request: Request, q: str = "", view: str = "discover", offset: int = 0):
     user = require_user(request)
-    if view not in ("discover", "following", "followers") or len(q) > 80 or offset < 0:
+    if view not in ("discover", "following", "followers", "connections") or len(q) > 80 or offset < 0:
         raise HTTPException(400, "Invalid player search")
     relation = ""
     params = [user["id"], f"%{q.strip()}%"]
-    if view != "discover":
+    if view == 'connections':
+        relation = ' AND EXISTS(SELECT 1 FROM follows f WHERE (f.follower_id=? AND f.followed_id=u.id) OR (f.followed_id=? AND f.follower_id=u.id))'
+        params.extend([user['id'], user['id']])
+    elif view != "discover":
         relation = (" AND EXISTS(SELECT 1 FROM follows f WHERE f.follower_id=? AND f.followed_id=u.id)" if view == "following"
                     else " AND EXISTS(SELECT 1 FROM follows f WHERE f.followed_id=? AND f.follower_id=u.id)")
         params.append(user["id"])
@@ -247,6 +278,7 @@ async def upload(request: Request):
     filename = unquote(request.headers.get("x-filename", "video"))[:200]
     temp_path = DATA / "tmp" / f"{uuid.uuid4()}.upload"
     size = 0
+    digest = hashlib.sha256()
     try:
         async with UPLOAD_SLOTS:
             with temp_path.open("wb") as target:
@@ -255,6 +287,7 @@ async def upload(request: Request):
                     if size > MAX_SIZE:
                         raise HTTPException(413, "Video exceeds the 100 MB limit")
                     target.write(chunk)
+                    digest.update(chunk)
         if size == 0:
             raise HTTPException(400, "Choose a video file")
         probe = subprocess.run(
@@ -283,6 +316,7 @@ async def upload(request: Request):
                     video_id, user["id"], filename, size, duration, str(raw_path), None,
                     "PROCESSING", "Preparing video", None, iso(), iso()
                 ))
+                db.execute("INSERT INTO video_fingerprints VALUES (?,?)", (video_id, digest.hexdigest()))
         except Exception:
             shutil.rmtree(folder, ignore_errors=True)
             raise
@@ -308,8 +342,11 @@ def videos(request: Request):
         output = []
         for row in rows:
             item = public_video(row)
+            job = db.execute("SELECT next_attempt_at,failure_code FROM analysis_jobs WHERE video_id=?", (row["id"],)).fetchone()
+            item["recovery"] = dict(job) if job else None
             result = db.execute("SELECT result_json FROM analyses WHERE video_id=?", (row["id"],)).fetchone()
             item["result"] = json.loads(result[0]) if result else None
+            item.update(report_extras(db, row['id']))
             output.append(item)
     return output
 
@@ -321,7 +358,70 @@ def video(request: Request, video_id: str):
     with connect() as db:
         result = db.execute("SELECT result_json FROM analyses WHERE video_id=?", (video_id,)).fetchone()
         item["result"] = json.loads(result[0]) if result else None
+        job = db.execute("SELECT next_attempt_at,failure_code FROM analysis_jobs WHERE video_id=?", (video_id,)).fetchone()
+        item["recovery"] = dict(job) if job else None
+        item.update(report_extras(db, video_id))
     return item
+
+
+def report_extras(db, video_id):
+    fingerprint = db.execute('SELECT sha256 FROM video_fingerprints WHERE video_id=?', (video_id,)).fetchone()
+    notes = db.execute('SELECT note,feedback FROM session_notes WHERE video_id=?', (video_id,)).fetchone()
+    issue = db.execute('SELECT reason,detail,timestamp_seconds FROM report_issues WHERE video_id=?', (video_id,)).fetchone()
+    return {'sha256': fingerprint[0] if fingerprint else None,
+            'notes': dict(notes) if notes else {'note': '', 'feedback': None},
+            'issue': dict(issue) if issue else None}
+
+
+@app.put('/api/videos/{video_id}/notes')
+def save_notes(request: Request, video_id: str, body: SessionNotes):
+    check_origin(request)
+    owned_video(request, video_id)
+    with connect(immediate=True) as db:
+        status = db.execute('SELECT status FROM videos WHERE id=?', (video_id,)).fetchone()[0]
+        if status != 'COMPLETED':
+            raise HTTPException(409, 'Notes are available after analysis is complete')
+        db.execute('INSERT OR REPLACE INTO session_notes VALUES (?,?,?,?)', (video_id, body.note.strip(), body.feedback, iso()))
+    return {'note': body.note.strip(), 'feedback': body.feedback}
+
+
+@app.put('/api/videos/{video_id}/issue')
+def save_report_issue(request: Request, video_id: str, body: ReportIssue):
+    check_origin(request)
+    row = owned_video(request, video_id)
+    if row['status'] != 'COMPLETED':
+        raise HTTPException(409, 'Report feedback is available after analysis')
+    if body.timestamp_seconds is not None and body.timestamp_seconds > row['duration_seconds']:
+        raise HTTPException(400, 'Timestamp is outside this video')
+    with connect() as db:
+        db.execute('INSERT OR REPLACE INTO report_issues VALUES (?,?,?,?,?)',
+                   (video_id, body.reason, body.detail.strip(), body.timestamp_seconds, iso()))
+    return {'reason': body.reason, 'detail': body.detail.strip(), 'timestamp_seconds': body.timestamp_seconds}
+
+
+@app.get('/api/videos/{video_id}/evidence/{number}')
+def report_evidence(request: Request, video_id: str, number: int):
+    return evidence_response(request, video_id, number, False)
+
+
+@app.get('/api/videos/{video_id}/evidence/{number}/clip')
+def report_replay(request: Request, video_id: str, number: int):
+    return evidence_response(request, video_id, number, True)
+
+
+def evidence_response(request, video_id, number, clip):
+    row = owned_video(request, video_id)
+    if row['status'] != 'COMPLETED' or number not in (1, 2, 3):
+        raise HTTPException(404)
+    with connect() as db:
+        report = db.execute('SELECT result_json FROM analyses WHERE video_id=?', (video_id,)).fetchone()
+    moment = next((item for item in json.loads(report[0]).get('evidence', []) if item.get('number') == number), None) if report else None
+    if not moment or (clip and not moment.get('clip')):
+        raise HTTPException(404)
+    path = evidence_dir(video_id) / f"{number}.{'mp4' if clip else 'jpg'}"
+    if not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path, media_type='video/mp4' if clip else 'image/jpeg', headers={'Cache-Control': 'private, no-store'})
 
 
 @app.get("/api/videos/{video_id}/preview/{number}")
@@ -360,7 +460,11 @@ def select(request: Request, video_id: str, body: Selection):
         db.execute("INSERT OR REPLACE INTO selections VALUES (?,?,?,?)", (
             video_id, body.timestamp_seconds, body.x, body.y
         ))
-        db.execute("INSERT OR REPLACE INTO analysis_options VALUES (?,?,?)", (video_id, engine, int(body.external_consent)))
+        db.execute("INSERT OR REPLACE INTO analysis_options VALUES (?,?,?)",
+                   (video_id, engine, int(body.external_consent)))
+        db.execute("INSERT OR REPLACE INTO evidence_preferences(video_id,enabled,keep_clips) VALUES (?,?,?)",
+                   (video_id, int(body.save_evidence), int(body.save_evidence and body.save_clips)))
+        db.execute("INSERT OR REPLACE INTO analysis_jobs(video_id,model) VALUES (?,?)", (video_id, os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")))
         db.execute("UPDATE users SET consent_at=COALESCE(consent_at,?) WHERE id=?", (iso(), row["user_id"]))
         db.execute("UPDATE videos SET status='QUEUED', stage='Waiting for analysis', updated_at=? WHERE id=?", (iso(), video_id))
     return {"ok": True}
@@ -376,8 +480,11 @@ def delete_video(request: Request, video_id: str):
             raise HTTPException(409, "Wait for this job to finish before deleting it")
         db.execute("DELETE FROM analyses WHERE video_id=?", (video_id,))
         db.execute("DELETE FROM provider_results WHERE video_id=?", (video_id,))
+        db.execute("DELETE FROM session_notes WHERE video_id=?", (video_id,))
+        db.execute("DELETE FROM report_issues WHERE video_id=?", (video_id,))
         db.execute("UPDATE videos SET status='DELETED', stage='Deleted', updated_at=? WHERE id=?", (iso(), video_id))
     shutil.rmtree(video_dir(video_id), ignore_errors=True)
+    shutil.rmtree(evidence_dir(video_id), ignore_errors=True)
     return {"ok": True}
 
 
@@ -394,9 +501,25 @@ def retry_video(request: Request, video_id: str):
             raise HTTPException(409, "Original media is unavailable. Upload a new clip")
         selected = db.execute("SELECT 1 FROM selections JOIN analysis_options USING(video_id) WHERE video_id=?", (video_id,)).fetchone()
         queued = prepared and selected
+        db.execute("UPDATE analysis_jobs SET automatic_retries=0,failure_code=NULL WHERE video_id=?", (video_id,))
         db.execute("UPDATE videos SET status=?, stage=?, error=NULL, updated_at=? WHERE id=?", (
             "QUEUED" if queued else "WAITING_FOR_PLAYER" if prepared else "PROCESSING",
             "Waiting for analysis" if queued else "Choose your player" if prepared else "Preparing video", iso(), video_id))
+    return {"ok": True}
+
+
+@app.post("/api/videos/{video_id}/reselect")
+def reselect_video(request: Request, video_id: str):
+    check_origin(request)
+    row = owned_video(request, video_id)
+    with connect(immediate=True) as db:
+        current = db.execute("SELECT status FROM videos WHERE id=?", (video_id,)).fetchone()
+        if current[0] != "FAILED" or not row["normalized_path"] or not Path(row["normalized_path"]).exists():
+            raise HTTPException(409, "Player selection is unavailable for this clip")
+        db.execute("DELETE FROM selections WHERE video_id=?", (video_id,))
+        db.execute("DELETE FROM provider_results WHERE video_id=?", (video_id,))
+        db.execute("DELETE FROM review_cache_keys WHERE video_id=?", (video_id,))
+        db.execute("UPDATE videos SET status='WAITING_FOR_PLAYER',stage='Choose your player',error=NULL,updated_at=? WHERE id=?", (iso(), video_id))
     return {"ok": True}
 
 

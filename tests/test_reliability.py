@@ -59,25 +59,30 @@ def success():
 @pytest.mark.parametrize('failure',[httpx.Response(503),httpx.Response(429),httpx.ReadTimeout('timeout'),httpx.Response(200,json={})])
 def test_transient_failure_recovers(clients,monkeypatch,failure):
     row, selection, calls = prepare_provider(clients,monkeypatch,[failure,success()])
+    with pytest.raises(review.RetryableReviewError):
+        review.gemini_review(row,selection,True)
+    assert len(calls)==1
     assert review.gemini_review(row,selection,True)['performance']['score']==63
     assert len(calls)==2
     with core.connect() as db:
         assert [r[0] for r in db.execute('SELECT status FROM provider_requests ORDER BY id')]==['retryable','succeeded']
-        assert [r[0] for r in db.execute('SELECT model FROM provider_requests ORDER BY id')]==['gemini-3.1-flash-lite','gemini-3.5-flash-lite']
+        assert [r[0] for r in db.execute('SELECT model FROM provider_requests ORDER BY id')]==['gemini-3.1-flash-lite','gemini-3.1-flash-lite']
 
 
 def test_long_retry_after_does_not_hold_worker(clients,monkeypatch):
     row, selection, calls = prepare_provider(clients,monkeypatch,[httpx.Response(429,headers={'Retry-After':'120'})])
-    with pytest.raises(RuntimeError,match='clip is saved'):
+    with pytest.raises(review.RetryableReviewError) as caught:
         review.gemini_review(row,selection,True)
+    assert caught.value.delay == 120
     assert len(calls)==1
 
 
 def test_outage_is_bounded_and_manual_retry_works(clients,monkeypatch):
     responses=[httpx.Response(503) for _ in range(3)]+[success()]
     row, selection, calls = prepare_provider(clients,monkeypatch,responses)
-    with pytest.raises(RuntimeError,match='clip is saved'):
-        review.gemini_review(row,selection,True)
+    for _ in range(3):
+        with pytest.raises(review.RetryableReviewError):
+            review.gemini_review(row,selection,True)
     assert len(calls)==3
     assert review.gemini_review(row,selection,True)['performance']['score']==63
     assert len(calls)==4

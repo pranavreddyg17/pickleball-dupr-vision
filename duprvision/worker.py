@@ -8,13 +8,14 @@ import time
 import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .core import DATA, ROOT, cleanup_media, connect, expire_media, init_db, iso, video_dir
+from .core import DATA, ROOT, cleanup_media, connect, expire_media, init_db, iso, now, video_dir
+from .evidence import build_evidence, marked_reference, serialize_track, track_player
 from .pose_review import build_pose_review
-from .review import gemini_review
+from .review import gemini_review, RetryableReviewError
 
 SAMPLE_HZ = 5
 TRACK_HZ = 15
@@ -176,19 +177,65 @@ def process(row):
             with connect() as db:
                 selection = db.execute("SELECT * FROM selections WHERE video_id=?", (row["id"],)).fetchone()
                 options = db.execute("SELECT * FROM analysis_options WHERE video_id=?", (row["id"],)).fetchone()
+                evidence_preference = db.execute("SELECT enabled,keep_clips FROM evidence_preferences WHERE video_id=?", (row["id"],)).fetchone()
             if not selection:
                 raise RuntimeError("Player selection is missing")
+            tracked = None
+            reference = None
+            if evidence_preference and evidence_preference["enabled"] and options and options["engine"] == "gemini":
+                try:
+                    with LOCAL_MODEL_LOCK:
+                        tracked = track_player(row, selection)
+                    reference = marked_reference(row, selection, tracked)
+                except Exception as exc:
+                    print(f"Player tracking unavailable for {row['id']}: {type(exc).__name__}", flush=True)
             if options and options["engine"] == "gemini":
                 update(row["id"], stage="Reviewing shots and rallies")
-                result = gemini_review(row, selection, bool(options["external_consent"]))
+                result = gemini_review(row, selection, bool(options["external_consent"]), reference)
             else:
                 with LOCAL_MODEL_LOCK:
                     result = track_and_analyze(row, selection)
+            # Cached observations may be reused, but media always belongs to this upload.
+            result.pop('evidence', None)
+            result.pop('player_track', None)
+            if evidence_preference and evidence_preference["enabled"]:
+                update(row["id"], stage="Preparing key moments")
+                try:
+                    with LOCAL_MODEL_LOCK:
+                        if tracked is None:
+                            tracked = track_player(row, selection)
+                    result['player_track'] = serialize_track(row, tracked)
+                    result["evidence"] = build_evidence(row, result, tracked, bool(evidence_preference['keep_clips']))
+                except Exception as exc:
+                    print(f"Snapshot rendering failed for {row['id']}: {type(exc).__name__}", flush=True)
+                    result["evidence"] = []
             result["score_date"] = datetime.fromisoformat(row["created_at"]).astimezone(ZoneInfo(os.getenv("APP_TIMEZONE", "America/Chicago"))).date().isoformat()
             with connect() as db:
                 db.execute("INSERT OR REPLACE INTO analyses VALUES (?,?,?)", (row["id"], json.dumps(result), iso()))
                 db.execute("UPDATE videos SET status='COMPLETED', stage='Complete', error=NULL, updated_at=? WHERE id=?", (iso(), row["id"]))
+                db.execute("UPDATE analysis_jobs SET next_attempt_at=NULL,failure_code=NULL WHERE video_id=?", (row["id"],))
+    except RetryableReviewError as exc:
+        with connect(immediate=True) as db:
+            retries = db.execute("SELECT automatic_retries FROM analysis_jobs WHERE video_id=?", (row["id"],)).fetchone()[0]
+            delay = max(exc.delay, 30 * 2**retries)
+            due = iso(now() + timedelta(seconds=delay))
+            # Respect provider cooldown globally; malformed responses affect only this job.
+            if exc.code.startswith("HTTP_") or "Timeout" in exc.code or "Connect" in exc.code:
+                db.execute("INSERT INTO provider_health VALUES ('gemini',?) ON CONFLICT(name) DO UPDATE SET cooldown_until=MAX(cooldown_until,excluded.cooldown_until)", (due,))
+            retry = retries < (1 if exc.code in ('INVALID_RESPONSE', 'INCOMPLETE_RESPONSE') else 2) and delay <= 600
+            invalid = exc.code in ('INVALID_RESPONSE', 'INCOMPLETE_RESPONSE')
+            message = ("The provider returned an incomplete report. Retrying automatically." if retry else
+                       "The provider could not produce a valid report. Try again or choose a clearer player.") if invalid else (
+                       "Video service is busy. Retrying automatically." if retry else
+                       "Video service remains unavailable. Your clip is saved; try again later.")
+            db.execute("UPDATE analysis_jobs SET automatic_retries=automatic_retries+1,next_attempt_at=?,failure_code=? WHERE video_id=?", (due, exc.code, row["id"]))
+            db.execute("UPDATE videos SET status=?,stage=?,error=?,updated_at=? WHERE id=?", (
+                "RETRY_WAIT" if retry else "FAILED", "Waiting to retry" if retry else "Analysis paused",
+                message, iso(), row["id"]))
+        return
     except Exception as exc:
+        with connect() as db:
+            db.execute("UPDATE analysis_jobs SET failure_code=?,next_attempt_at=NULL WHERE video_id=?", (getattr(exc, "code", "PROCESSING_ERROR"), row["id"]))
         update(row["id"], status="FAILED", stage="Analysis failed", error=str(exc)[:250])
         return
     if row["status"] != "PROCESSING":
@@ -200,7 +247,15 @@ def process(row):
 
 def claim_next():
     with connect(immediate=True) as db:
-        row = db.execute("SELECT * FROM videos WHERE status IN ('PROCESSING','QUEUED') ORDER BY created_at LIMIT 1").fetchone()
+        capacity = max(1, min(3, int(os.getenv("PROVIDER_CONCURRENCY", "1"))))
+        busy = db.execute("SELECT COUNT(*) FROM videos JOIN analysis_options ON id=video_id WHERE status='ANALYZING' AND engine='gemini'").fetchone()[0]
+        cooling = db.execute("SELECT 1 FROM provider_health WHERE name='gemini' AND cooldown_until>?", (iso(),)).fetchone()
+        row = db.execute("""SELECT v.* FROM videos v
+            LEFT JOIN analysis_options o ON o.video_id=v.id
+            LEFT JOIN analysis_jobs j ON j.video_id=v.id
+            WHERE (v.status IN ('PROCESSING','QUEUED') OR (v.status='RETRY_WAIT' AND j.next_attempt_at<=?))
+            AND (v.status='PROCESSING' OR COALESCE(o.engine,'local')!='gemini' OR ?)
+            ORDER BY v.created_at LIMIT 1""", (iso(), int(busy < capacity and not cooling))).fetchone()
         if row:
             db.execute("UPDATE videos SET status=?, updated_at=? WHERE id=?", (
                 "PREPARING" if row["status"] == "PROCESSING" else "ANALYZING", iso(), row["id"]
@@ -221,6 +276,17 @@ def dispatch(pool, futures, capacity):
         futures.add(pool.submit(process, row))
 
 
+def recover_interrupted():
+    with connect(immediate=True) as db:
+        db.execute("UPDATE videos SET status='PROCESSING' WHERE status='PREPARING'")
+        db.execute("UPDATE videos SET status='QUEUED' WHERE status='ANALYZING'")
+        # An interrupted request may already have incurred cost. Do not resend immediately.
+        due = iso(now() + timedelta(seconds=30))
+        db.execute("UPDATE analysis_jobs SET next_attempt_at=?,failure_code='INTERRUPTED' WHERE video_id IN (SELECT video_id FROM provider_requests WHERE status='inflight')", (due,))
+        db.execute("UPDATE videos SET status='RETRY_WAIT',stage='Waiting to resume' WHERE status='QUEUED' AND id IN (SELECT video_id FROM analysis_jobs WHERE failure_code='INTERRUPTED')")
+        db.execute("UPDATE provider_requests SET status='interrupted',failure_code='INTERRUPTED' WHERE status='inflight'")
+
+
 def main():
     init_db()
     with (DATA / "worker.lock").open("w") as lock:
@@ -228,10 +294,7 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit("Another DUPRVision worker is already running")
-        with connect() as db:
-            db.execute("UPDATE videos SET status='PROCESSING' WHERE status='PREPARING'")
-            db.execute("UPDATE videos SET status='QUEUED' WHERE status='ANALYZING'")
-            db.execute("UPDATE provider_requests SET status='interrupted' WHERE status='inflight'")
+        recover_interrupted()
         last_cleanup = 0
         stopped = threading.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):

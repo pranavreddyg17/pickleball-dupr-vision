@@ -14,5 +14,5 @@ if [ ! -d .venv ]; then "$PYTHON_BIN" -m venv .venv; fi
 .venv/bin/python -m pip install -r requirements.txt
 if [ ! -f .env ]; then cp .env.example .env; fi
 .venv/bin/python -c "from duprvision.core import init_db; init_db()"
-.venv/bin/python -c "from ultralytics import YOLO; YOLO('yolo26n-pose.pt')"
+.venv/bin/python -c "from ultralytics import YOLO; YOLO('yolo26n-pose.pt'); YOLO('yolo26n.pt')"
 echo "Ready. Local analysis needs no API key. Run ./scripts/start.sh"

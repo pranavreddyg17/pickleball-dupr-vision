@@ -1,0 +1,80 @@
+// Run against tests/ui_fixture.py in a disposable local database only.
+import {chromium} from 'playwright';
+import {readFile} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+import assert from 'node:assert/strict';
+
+const base=process.env.DUPRVISION_UI_URL||'http://127.0.0.1:3017';
+assert.equal(new URL(base).hostname,'127.0.0.1');
+assert.ok(process.env.DUPRVISION_REPLAY_FIXTURE,'Set DUPRVISION_REPLAY_FIXTURE to a short playable MP4');
+const clip=await readFile(process.env.DUPRVISION_REPLAY_FIXTURE);
+const sha256=createHash('sha256').update(clip).digest('hex');
+const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+try {
+  const page=await browser.newPage({viewport:{width:1440,height:1000}});
+  const errors=[],uploads=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  page.on('request',r=>{if(r.method()==='POST'&&new URL(r.url()).pathname==='/api/videos')uploads.push(r.url());});
+  await page.route('**/api/videos',async route=>{
+    const response=await route.fetch(), rows=await response.json();
+    rows.find(v=>v.id==='qa-local-0').sha256=sha256;
+    Object.assign(rows.find(v=>v.id==='qa-local-1'),{status:'QUEUED',result:null,stage:'UI polling fixture'});
+    await route.fulfill({response,json:rows});
+  });
+  await page.goto(base);
+  await page.locator('#email').fill('qa-local@example.test');
+  await page.locator('#password').fill('local-ui-test-2026');
+  await page.getByRole('button',{name:'Sign in',exact:true}).click();
+  await page.getByRole('heading',{name:'Recent sessions'}).waitFor();
+  await page.screenshot({path:'/tmp/duprvision-progress-desktop.png',fullPage:true});
+  await page.locator('.session-row[data-video="qa-local-0"]').click();
+  await page.locator('#replay-input').setInputFiles({name:'wrong.mp4',mimeType:'video/mp4',buffer:Buffer.from('wrong')});
+  await page.getByText('This file does not match the analyzed clip. Choose the original video.').waitFor();
+  await page.locator('#replay-input').setInputFiles({name:'original.mp4',mimeType:'video/mp4',buffer:clip});
+  await page.waitForFunction(()=>document.getElementById('replay-video')?.readyState>=2);
+  await page.locator('.review-events [data-seek="12"]').click();
+  await page.waitForFunction(()=>document.getElementById('replay-video').currentTime>=12);
+  await page.locator('#replay-speed').selectOption('0.5');
+  assert.equal(await page.locator('#replay-video').evaluate(v=>v.playbackRate),.5);
+  await page.evaluate(()=>{window.testReplayElement=document.getElementById('replay-video');});
+  const before=await page.locator('#replay-video').evaluate(v=>v.currentTime);
+  await page.waitForTimeout(3500);
+  assert.equal(await page.evaluate(()=>window.testReplayElement===document.getElementById('replay-video')),true);
+  assert.ok(await page.locator('#replay-video').evaluate(v=>v.currentTime)>before,'Background polling must not interrupt playback');
+  await page.getByRole('heading',{name:'Key moments'}).waitFor();
+  assert.equal(await page.locator('.evidence-item img').first().evaluate(img=>img.complete&&img.naturalWidth>0),true);
+  await page.getByRole('button',{name:'About this score'}).click();
+  await page.getByRole('dialog',{name:'About this score'}).waitFor();
+  await page.getByRole('dialog',{name:'About this score'}).getByRole('button',{name:'Close'}).click();
+  await page.getByRole('button',{name:/^(Add a note|Edit)$/}).click();
+  await page.locator('#session-note').fill('Practice resets. <script>not markup</script>');
+  await page.getByText('Saved',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'Done'}).click();
+  await page.getByRole('button',{name:/^(Report an issue|Edit reported issue)$/}).click();
+  await page.locator('#issue-reason').selectOption('shot');
+  await page.locator('#issue-time').fill('12');
+  await page.locator('#issue-detail').fill('The drive label looks wrong.');
+  await page.getByRole('button',{name:'Send feedback'}).click();
+  await page.getByText('Issue recorded').waitFor();
+  assert.equal(uploads.length,0,'Local replay must never reupload the file');
+  for(const width of [1440,390,320]) {
+    await page.setViewportSize({width,height:width===1440?1000:844});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`Overflow at ${width}px`);
+    await page.screenshot({path:`/tmp/duprvision-shot-review-${width}.png`,fullPage:true});
+  }
+  await page.reload();
+  await page.locator('.session-row[data-video="qa-local-0"]').click();
+  await page.getByRole('button',{name:'Edit',exact:true}).click();
+  assert.equal(await page.locator('#session-note').inputValue(),'Practice resets. <script>not markup</script>');
+  await page.getByRole('button',{name:'Done'}).click();
+  assert.equal(await page.evaluate(()=>replay),null,'Reload must release local video');
+  await page.locator('#replay-input').setInputFiles({name:'original.mp4',mimeType:'video/mp4',buffer:clip});
+  await page.locator('#replay-video').waitFor();
+  await page.locator('[data-page="profile"]').first().click();
+  await page.getByRole('button',{name:'Sign out',exact:true}).click();
+  await page.getByRole('heading',{name:'Welcome back'}).waitFor();
+  assert.equal(await page.evaluate(()=>replay),null);
+  assert.equal(await page.evaluate(()=>noteDrafts.size),0);
+  assert.deepEqual(errors,[]);
+  console.log('Practice UI passed: replay verification, timestamps, slow motion, private notes, reload/logout cleanup, zero uploads, desktop/mobile layout.');
+} finally {await browser.close();}
