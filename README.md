@@ -4,7 +4,7 @@ Video review and daily progress tracking for pickleball players.
 
 [Watch the demo](docs/demo.mp4)
 
-The demo uses a 27-second gameplay clip and the report saved by DUPRVision for that clip: Vision score 97/100, nine assessed shots, and one rally. AI observations are fallible; the clip and score are an example, not a validated skill rating.
+The demo records the full app workflow with `1.mp4`: create an account, upload the clip, select a player, consent to analysis, wait for the worker, inspect the report, and review the daily calendar and player directory. This captured run scored 83/100 from nine assessed shots and one rally. The score can vary on another run; AI observations are fallible and are not a validated skill rating.
 
 ## What it does
 

@@ -70,6 +70,8 @@ def start_tunnel():
             match = TUNNEL_URL.search(line)
             if match:
                 discovered.put(match.group())
+            elif 'Unauthorized: Tunnel not found' in line:
+                discovered.put(None)
 
     threading.Thread(target=read_output, daemon=True).start()
     return process, discovered
@@ -119,6 +121,13 @@ def main():
                 failures = 0
             try:
                 new_origin = urls.get(timeout=2)
+                if new_origin is None:
+                    log("Tunnel authorization expired; reconnecting")
+                    terminate(tunnel)
+                    tunnel = None
+                    origin = None
+                    stopping.wait(5)
+                    continue
                 if new_origin != origin:
                     origin = new_origin
                     log(f"Tunnel available: {origin}")

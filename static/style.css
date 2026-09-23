@@ -24,5 +24,6 @@ input:not([type=checkbox]):focus,select:focus{border-color:var(--blue);outline:0
 .topbar-inner{gap:40px}.topbar nav{gap:22px}.nav-item{transition:color .15s,border-color .15s}.nav-item:hover{color:var(--blue)}
 .main{padding-top:40px}.page-head{margin-bottom:28px}.section{margin-top:36px}.session-row{padding-left:10px;padding-right:10px}.session-row:hover{background:#f5f7fa}
 .upload-zone{border-radius:6px;background:#fbfcfd}.tabs button:hover{color:var(--blue)}
+.preview-wrap img{visibility:hidden}
 @media(max-width:800px){.topbar-inner{gap:24px}.topbar nav{gap:16px}.main{padding-top:30px}}
 @media(max-width:560px){.auth{width:min(100% - 44px,420px);padding-top:32px;padding-bottom:32px}.auth-form{padding:48px 0}.auth-form h1{font-size:26px}.auth-switch{flex-wrap:wrap}.main{padding-top:26px}.topbar nav{gap:0}.section{margin-top:28px}.session-row{padding-left:4px;padding-right:4px}}

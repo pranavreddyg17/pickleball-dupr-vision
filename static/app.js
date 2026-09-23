@@ -177,6 +177,17 @@ function render() {
   const previousScroll=document.querySelector('.calendar-scroll')?.scrollLeft;
   document.title=state.user?`${({home:'Overview',analyze:'Analyze',players:'Players',profile:'Account'})[state.page]} | DUPRVision`:'DUPRVision';
   app.innerHTML=state.user?shell(state.selectedId?detailView():({home:homeView,analyze:analyzeView,players:playersView,profile:profileView}[state.page])()):authView();
+  const preview=document.getElementById('preview-image');
+  if(preview) {
+    const fitPreview=()=>{
+      if(!preview.naturalWidth||!preview.naturalHeight)return;
+      const scale=Math.min(900/preview.naturalWidth,(window.innerWidth-40)/preview.naturalWidth,Math.min(600,window.innerHeight*.65)/preview.naturalHeight);
+      preview.parentElement.style.width=`${Math.round(preview.naturalWidth*scale)}px`;
+      preview.style.visibility='visible';
+    };
+    if(preview.complete)fitPreview();
+    else preview.addEventListener('load',fitPreview,{once:true});
+  }
   const calendarScroll=document.querySelector('.calendar-scroll');
   if(calendarScroll) {
     const today=document.querySelector(`[data-day="${state.scores.today}"]`);

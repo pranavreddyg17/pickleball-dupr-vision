@@ -13,3 +13,4 @@ node_modules/
 static/court.png
 scripts/com.duprvision.public.plist
 cloudflare/wrangler.jsonc
+docs/*.webm
