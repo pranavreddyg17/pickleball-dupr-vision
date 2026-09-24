@@ -1,5 +1,5 @@
 const app = document.getElementById('app');
-const state = {user:null, videos:[], scores:null, self:null, page:'home', selectedId:null, allSessions:false,
+const state = {user:null, videos:[], scores:null, self:null, page:'home', selectedId:null, allSessions:false, videoView:'sessions', reportTab:'review', routeReady:false,
   player:null, players:[], playerView:'discover', search:'', offset:0, hasMore:false,
   year:null, day:null, preview:1, point:null, consent:false, saveEvidence:true, authMode:'login',
   busy:false, uploadProgress:0, error:'', notice:'', workerRunning:false, engine:'local', analysisConfigured:true, externalConsent:false};
@@ -32,8 +32,10 @@ async function refresh(draw=true) {
     const user = await api('/me');
     const [videos,scores,health,self] = await Promise.all([api('/videos'),api('/scores'),api('/health'),api(`/players/${user.id}`)]);
     Object.assign(state,{user,videos,scores,self,workerRunning:health.worker_running,engine:health.analysis_engine,analysisConfigured:health.analysis_configured});
+    if(draw&&state.page==='schedule')await Promise.all([loadUpcoming(),loadSchedule(),loadCompetitions()]);
+    if(draw&&!state.routeReady){await restoreRoute();state.routeReady=true;}
   } catch (error) {
-    if (error.status === 401) {closeConnections();clearReplay();noteDrafts.clear();Object.assign(state,{user:null,videos:[],scores:null,self:null,selectedId:null,player:null});}
+    if (error.status === 401) {closeConnections();closePlan();playing.events=[];playing.upcoming=[];clearReplay();noteDrafts.clear();Object.assign(state,{user:null,videos:[],scores:null,self:null,selectedId:null,player:null});}
     else state.error = error.message;
   }
   if (draw) render();
@@ -115,14 +117,15 @@ function authView() {
 }
 
 function shell(content) {
-  const nav = [['home','Overview'],['analyze','Analyze'],['players','Players'],['profile','Account']]
-    .map(([key,label]) => `<button class="nav-item ${state.page === key ? 'active' : ''}" data-page="${key}" ${state.page === key ? 'aria-current="page"' : ''}>${label}</button>`).join('');
-  return `<header class="topbar"><div class="topbar-inner"><a class="brand" href="/">DUPRVision<span class="brand-dot"></span></a><nav aria-label="Main">${nav}</nav></div></header>
-    <main class="main">${message()}${content}</main>`;
+  const root=state.page==='analyze'?'home':state.page==='competition'?'schedule':state.page;
+  const nav = [['home','Analyze'],['schedule','Events'],['players','Players']]
+    .map(([key,label]) => `<button class="nav-item ${root===key?'active':''}" data-page="${key}" ${root===key?'aria-current="page"':''}>${label}</button>`).join('');
+  return `<header class="topbar"><div class="topbar-inner"><a class="brand" href="#videos">DUPRVision<span class="brand-dot"></span></a><nav aria-label="Main">${nav}</nav><button class="account-control" data-page="profile" aria-label="Account" title="Account" ${root==='profile'?'aria-current="page"':''}>${avatar(state.user.display_name)}</button></div></header>
+    <main class="main" data-surface="${root}">${message()}${content}</main>`;
 }
 
 function stats(history) {
-  return `<section class="score-summary" aria-label="Average performance"><span class="label">Average Vision score</span><div class="average-value">${num(history.average)}<span>/ 100</span></div><p class="fine">${history.average == null ? 'No scored sessions yet' : 'Clip performance · Daily average'}</p><div class="level-estimate"><div><span class="label">DUPR-scale equivalent</span><p class="fine">Uncalibrated estimate</p></div><strong>${history.dupr_equivalent == null ? '--' : Number(history.dupr_equivalent).toFixed(1)}</strong></div></section>`;
+  return `<section class="score-summary" aria-label="Clip progress"><div><span class="label">Average clip score</span><div class="average-value">${num(history.average)}<span>/ 100</span></div><p class="fine">${history.average==null?'No scored videos yet':`${history.scored_days??history.days.filter(d=>d.score!=null).length} scored days`}</p></div><button class="text-button" data-action="explain-average">About this score</button></section>`;
 }
 
 function calendar(history) {
@@ -149,7 +152,7 @@ function calendar(history) {
       : `<span class="day ${inYear?'future':'outside'}"></span>`;
   }
   const selected = lookup[state.day];
-  return `<section class="section calendar-section"><div class="section-head"><h2>Daily activity</h2><select id="calendar-year" aria-label="Calendar year">${years.map(y=>`<option ${y===year?'selected':''}>${y}</option>`).join('')}</select></div>
+  return `<section class="section calendar-section"><div class="section-head"><h2>Video activity</h2><select id="calendar-year" aria-label="Calendar year">${years.map(y=>`<option ${y===year?'selected':''}>${y}</option>`).join('')}</select></div>
     <div class="calendar-scroll"><div class="calendar-inner" style="--weeks:${count/7}"><div class="month-labels">${months}</div><div class="calendar-body"><div class="weekday-labels"><span>Mon</span><span>Wed</span><span>Fri</span></div><div class="heatmap">${cells}</div></div></div></div>
     <div class="calendar-meta"><div class="legend"><span>Lower score</span>${[1,2,3,4].map(l=>`<i class="day level-${l}"></i>`).join('')}<span>Higher score</span></div></div>
     ${state.day ? `<div class="selected-day"><strong>${dateLabel(state.day)}</strong><span>${selected ? `${selected.score == null ? 'No score' : `${num(selected.score)} Vision score`} &middot; ${reportCount(selected.clips)}` : 'No analysis'}</span>${button('Clear','clear-day','text-button')}</div>` : ''}
@@ -161,14 +164,15 @@ function homeView() {
   const active = v=>['PROCESSING','PREPARING','QUEUED','ANALYZING','RETRY_WAIT','WAITING_FOR_PLAYER'].includes(v.status);
   const ordered = state.day ? filtered : [...filtered.filter(active),...filtered.filter(v=>!active(v))];
   const videos = state.allSessions || state.day ? ordered : ordered.slice(0,6);
-  return `<div class="page-head overview-heading"><div><span class="label">Overview</span><h1>${esc(state.user.display_name)}</h1></div><button class="text-button connections-link" data-action="open-connections" aria-haspopup="dialog">Connections <span class="connection-count">${state.self.connections??0}</span></button></div>
-    <div class="overview-summary">${stats(state.scores)}${sessionFocus()}</div>${calendar(state.scores)}<section class="section sessions-section"><div class="section-head"><h2>${state.day ? 'Sessions on this day' : state.allSessions?'All sessions':'Recent sessions'}</h2>${!state.day&&filtered.length>6?button(state.allSessions?'Show recent':'View all','toggle-sessions','text-button'):''}</div>${videos.length ? `<div class="session-list">${videos.map(sessionRow).join('')}</div>` : `<p class="empty">${state.day?'No sessions on this day.':'Your completed sessions will appear here.'}</p>`}</section>`;
+  return `<div class="workspace-toolbar"><div class="view-tabs" role="tablist" aria-label="Video views">${[['sessions','Sessions'],['progress','Progress']].map(([key,label])=>`<button data-video-view="${key}" role="tab" aria-selected="${state.videoView===key}">${label}</button>`).join('')}</div><button class="primary toolbar-action" data-page="analyze">${icon('upload')}Analyze video</button></div>
+    ${state.videoView==='progress'?`${stats(state.scores)}${sessionFocus()}${calendar(state.scores)}`:''}<section class="section sessions-section"><div class="section-head"><h2>${state.day ? 'Sessions on this day' : state.allSessions?'All sessions':'Recent sessions'}</h2>${!state.day&&filtered.length>6?button(state.allSessions?'Show recent':'View all','toggle-sessions','text-button'):''}</div>${videos.length ? `<div class="session-list">${videos.map(sessionRow).join('')}</div>` : `<div class="workspace-empty"><h2>${state.day?'No videos on this day':'Your next session starts here'}</h2><p>${state.day?'Choose another day to see its reviews.':'No videos uploaded yet.'}</p>${!state.day?'<button class="text-button" data-page="analyze">Analyze a video</button>':''}</div>`}</section>`;
 }
 
 function sessionFocus() {
   const latest=state.videos.find(v=>v.status==='COMPLETED'&&v.result?.kind==='video_review_v2');
   if(!latest)return '';
-  const note=latest.notes?.note?.trim(), priority=latest.result.priority?.trim();
+  const note=latest.notes?.note?.trim(), result=latest.result;
+  const priority=result.performance?.version==='vision_score_v2' ? result.practice?.exercise : result.priority?.trim();
   if(!note&&latest.notes?.feedback==='inaccurate')return '';
   if(!note&&!priority)return '';
   return `<section class="session-focus"><span class="label">${note?'Your practice note':'Next session'}</span><p>${esc(note||priority)}</p><button class="text-button" data-video="${latest.id}">Review last session <span aria-hidden="true">&rarr;</span></button></section>`;
@@ -176,16 +180,10 @@ function sessionFocus() {
 
 function sessionRow(video) {
   const r = video.status==='COMPLETED'?video.result:null, score = r?.performance?.score;
-  return `<button class="session-row" data-video="${video.id}"><div><strong>${esc(video.original_filename)}</strong><span class="muted small">${dateLabel(video.created_at)} &middot; ${duration(video.duration_seconds)}</span></div><span class="session-status ${video.status==='FAILED'?'danger':''}">${score != null ? `<b>${num(score)}</b><small>Vision</small>` : esc(r ? 'View report' : video.status==='WAITING_FOR_PLAYER'?'Select player':video.stage)}</span><span aria-hidden="true">&rsaquo;</span></button>`;
+  const moment=r?.evidence?.[0];
+  return `<button class="session-row" data-video="${video.id}"><span class="session-thumbnail">${moment?`<img loading="lazy" src="/api/videos/${encodeURIComponent(video.id)}/evidence/${Number(moment.number)}" alt="">`:`<span aria-hidden="true">${duration(video.duration_seconds)}</span>`}</span><div><strong>${esc(video.original_filename)}</strong><span class="muted small">${dateLabel(video.created_at)} &middot; ${duration(video.duration_seconds)}</span></div><span class="session-status ${video.status==='FAILED'?'danger':''}">${score != null ? `<b>${num(score)}<small>/100</small></b><small>${r.performance.version==='vision_score_v2'?'Clip score':'Earlier score'}</small>` : esc(r ? 'View report' : video.status==='WAITING_FOR_PLAYER'?'Select player':video.stage)}</span><span aria-hidden="true">&rsaquo;</span></button>`;
 }
 
-function analyzeView() {
-  return `<div class="page-head"><h1>Analyze</h1><span class="muted small">${state.user.remaining} of 5 uploads remaining</span></div>
-    ${!state.workerRunning ? '<div class="alert">Analysis is temporarily unavailable. The local worker needs to restart.</div>' : ''}
-    ${!state.analysisConfigured ? '<div class="alert">Video review is awaiting owner configuration.</div>' : ''}
-    <section class="upload-zone"><h2>Gameplay video</h2><p class="muted">MP4, MOV &middot; Up to 3 minutes &middot; 100 MB max</p><input id="video-input" type="file" accept="video/mp4,video/quicktime,video/x-m4v,.mp4,.mov,.m4v" hidden><button class="primary" data-action="choose-video" ${state.busy || !state.workerRunning || !state.analysisConfigured || !state.user.remaining?'disabled':''}>Choose video</button>${state.busy?`<progress max="100" value="${state.uploadProgress}" aria-label="Upload progress"></progress><span id="upload-percent">${state.uploadProgress}%</span>`:''}</section>
-    <p class="fine retention-note">Video files are deleted after the report is saved. Reports and daily activity remain.</p>`;
-}
 
 function followButton(player) {
   return player.id === state.user.id ? '' : `<button class="${player.is_following?'secondary':'primary'} follow-button" data-follow="${player.id}" data-following="${player.is_following}">${player.is_following?'Following':'Follow'}</button>`;
@@ -193,10 +191,10 @@ function followButton(player) {
 function playersView() {
   if (state.player) {
     const p=state.player;
-    return `${button(`${icon('arrow-left')}Players`,'back-players','text-button')}<div class="page-head"><div class="player-identity">${avatar(p.display_name,true)}<div><h1>${esc(p.display_name)}</h1><p class="muted small">${p.followers} followers &middot; ${p.following} following</p></div></div>${followButton(p)}</div>${stats(p.history)}${calendar(p.history)}`;
+    return `${button(`${icon('arrow-left')}Players`,'back-players','text-button')}<div class="page-head"><div class="player-identity">${avatar(p.display_name,true)}<div><h1>${esc(p.display_name)}</h1><p class="muted small">${p.followers} followers &middot; ${p.following} following</p></div></div>${followButton(p)}</div>${upcomingView(p.playing||[])}${stats(p.history)}${calendar(p.history)}`;
   }
-  return `<div class="page-head"><h1>Players</h1></div><div class="directory-tools"><div class="tabs" role="tablist" aria-label="Players">${['discover','following','followers'].map(view=>`<button role="tab" aria-selected="${state.playerView===view}" data-people="${view}" class="${state.playerView===view?'active':''}">${view[0].toUpperCase()+view.slice(1)}</button>`).join('')}</div><form id="search-form"><input name="q" aria-label="Search players" placeholder="Search players" maxlength="80" value="${esc(state.search)}"><button class="secondary search-button" type="submit" aria-label="Search" title="Search">${icon('search')}</button></form></div>
-    <div class="player-list">${state.players.length ? state.players.map(p=>`<div class="player-row"><button class="player-identity" data-player="${p.id}">${avatar(p.display_name)}<span><strong>${esc(p.display_name)}</strong><span class="muted small">${p.latest ? `Last scored ${dateLabel(p.latest.date)}` : 'No scored clips'}</span></span></button><div class="player-score"><strong>${num(p.average)}</strong><span class="muted small">Vision score</span></div>${followButton(p)}</div>`).join('') : '<p class="empty">No players found.</p>'}</div>
+  return `<div class="page-head players-heading"><div><button class="text-button" data-action="open-connections">Connections <span class="connection-count">${state.self?.connections??0}</span></button></div><form id="search-form"><input name="q" type="search" aria-label="Search players" placeholder="Search players" maxlength="80" value="${esc(state.search)}"><button class="search-button" type="submit" aria-label="Search" title="Search">${icon('search')}</button></form></div><div class="directory-tools"><div class="tabs" role="tablist" aria-label="Players">${['discover','following','followers'].map(view=>`<button role="tab" aria-selected="${state.playerView===view}" data-people="${view}" class="${state.playerView===view?'active':''}">${view[0].toUpperCase()+view.slice(1)}</button>`).join('')}</div></div>
+    <div class="player-list">${state.players.length ? state.players.map(p=>`<div class="player-row"><button class="player-identity" data-player="${p.id}">${avatar(p.display_name)}<span><strong>${esc(p.display_name)}</strong><span class="muted small">${p.latest ? `Last scored ${dateLabel(p.latest.date)}` : 'No scored clips'}</span></span></button><div class="player-score"><strong>${num(p.average)}</strong><span class="muted small">Clip average</span></div>${followButton(p)}</div>`).join('') : '<p class="empty">No players found.</p>'}</div>
     <div class="pagination">${state.offset ? button('Previous','previous-players') : ''}${state.hasMore ? button('Next','next-players') : ''}</div>${!state.user.discoverable?'<p class="fine">Your profile is private. Profile visibility can be changed in Account.</p>':''}`;
 }
 
@@ -207,11 +205,8 @@ function profileView() {
 function detailView() {
   const v=state.videos.find(video=>video.id===state.selectedId);
   if (!v) return homeView();
-  const heading=`${button(`${icon('arrow-left')}Reports`,'back-clips','text-button')}<div class="page-head"><div><h1>${v.status==='WAITING_FOR_PLAYER'?'Select player':'Session review'}</h1><p class="muted small">${esc(v.original_filename)} &middot; ${dateLabel(v.created_at)} &middot; ${duration(v.duration_seconds)}</p></div>${v.status==='COMPLETED'?`<button class="icon-button report-delete" data-action="delete-video" aria-label="Delete report" title="Delete report">${icon('trash-2')}</button>`:''}</div>`;
-  if (v.status==='WAITING_FOR_PLAYER') return heading+`<div class="tabs preview-tabs">${[1,2,3].map(n=>`<button class="${n===state.preview?'active':''}" data-preview="${n}">Frame ${n}</button>`).join('')}</div><div class="preview-wrap"><img id="preview-image" src="/api/videos/${v.id}/preview/${state.preview}" alt="Select your body in the video frame" tabindex="0">${state.point?`<span class="point" style="left:${state.point.x*100}%;top:${state.point.y*100}%" aria-hidden="true">+</span>`:''}</div><div class="selection-coordinates"><label>Player X <input id="point-x" type="number" min="0" max="100" step="1" value="${state.point?Math.round(state.point.x*100):50}" aria-label="Player horizontal position percent"></label><label>Player Y <input id="point-y" type="number" min="0" max="100" step="1" value="${state.point?Math.round(state.point.y*100):50}" aria-label="Player vertical position percent"></label><span class="muted small">${state.point?'Player selected':'Select yourself in the frame'}</span></div><label class="checkbox"><input id="consent" type="checkbox" ${state.consent?'checked':''}><span>I have permission to analyze this footage.</span></label>
-    ${state.engine==='gemini'?`<label class="checkbox"><input id="external-consent" type="checkbox" ${state.externalConsent?'checked':''}><span>I agree to send this clip and its player-selection frame to Google Gemini for video analysis. Other players may be visible. Google's API data policy applies.</span></label>`:''}
-    <label class="checkbox"><input id="save-evidence" type="checkbox" ${state.saveEvidence?'checked':''}><span>Keep up to three private replay clips and tracked frames with my report. The full upload is deleted.</span></label>
-    <div class="action-row"><button class="primary" data-action="start-analysis" ${canAnalyze()?'':'disabled'}>Analyze clip</button>${button('Delete clip','delete-video','text-button danger')}</div>`;
+  const heading=`${button(`${icon('arrow-left')}Analyze`,'back-clips','text-button')}<div class="page-head"><div><h1>${v.status==='WAITING_FOR_PLAYER'?'Select player':'Session review'}</h1><p class="muted small">${esc(v.original_filename)} &middot; ${dateLabel(v.created_at)} &middot; ${duration(v.duration_seconds)}</p></div>${v.status==='COMPLETED'?`<button class="icon-button report-delete" data-action="delete-video" aria-label="Delete report" title="Delete report">${icon('trash-2')}</button>`:''}</div>`;
+  if (v.status==='WAITING_FOR_PLAYER') return heading+selectionView(v);
   if (v.status==='COMPLETED') {
     const r=v.result;
     if (!['pose_review_v1','video_review_v1','video_review_v2'].includes(r.kind)) return heading+`<p class="empty">Archived report. Not included in scores.</p>${button('Delete report','delete-video','text-button danger')}`;
@@ -220,7 +215,7 @@ function detailView() {
   if (v.status==='FAILED') return heading+`<div class="failure"><h2>Analysis paused</h2><p>${esc(v.error)}</p><div class="action-row">${button('Try again','retry-video','primary')}${v.media_available?button('Choose player again','reselect-video','text-button'):''}${button('Delete clip','delete-video','text-button danger')}</div></div>`;
   if (v.status==='RETRY_WAIT') return heading+`<div class="failure"><h2>Waiting for video service</h2><p>Your clip is saved. Another attempt is scheduled${v.recovery?.next_attempt_at?' after '+esc(new Date(v.recovery.next_attempt_at).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})):''}.</p>${button('Cancel and delete clip','delete-video','text-button danger')}</div>`;
   if (v.status==='EXPIRED') return heading+`<p class="empty">This upload expired before analysis.</p><button class="primary" data-page="analyze">Upload a new clip</button>`;
-  return heading+`<div class="processing" role="status"><span class="spinner"></span><h2>${esc(v.stage)}</h2></div>`;
+  return heading+analysisSteps(2)+`<div class="processing" role="status"><span class="spinner"></span><h2>${esc(v.stage)}</h2></div>`;
 }
 
 function canAnalyze() { return state.point && state.consent && state.analysisConfigured && (state.engine!=='gemini'||state.externalConsent); }
@@ -245,14 +240,16 @@ function reportView(r) {
 
 function compactReport(r) {
   const p=r.performance, counts=Object.entries(r.shot_counts||{});
+  if(state.reportTab!=='breakdown')return `<section class="performance-summary"><div class="performance-number"><span class="label">Clip score</span><strong>${num(p.score)}</strong><span class="muted"> / 100</span></div><div><p>${esc(r.summary)}</p>${p.score==null?`<p class="fine">${esc(p.note)}</p>`:''}</div></section><div class="view-tabs"><button data-report-tab="review" aria-pressed="true">Review</button><button data-report-tab="breakdown">Breakdown</button></div>${replayView(r)}${practiceView(r)}`;
   const recordingIssue=r.recording_note&&/blur|unclear|occlu|obstruct|limit|miss|hidden|poor|low.resolution|shak|cut off|out.of.frame|not visible|cannot|can't|hard to|distant/i.test(r.recording_note);
-  return `<section class="performance-summary"><div class="performance-number"><span class="label">Vision score</span><strong>${num(p.score)}</strong><span class="muted"> / 100</span></div><div><p>${esc(r.summary)}</p>${r.priority?`<p class="next-focus"><strong>Next session</strong> ${esc(r.priority)}</p>`:''}${p.score==null?`<span class="fine">${esc(p.note)}</span>`:''}</div></section>
+  return `<section class="performance-summary"><div class="performance-number"><span class="label">Vision score</span><strong>${num(p.score)}</strong><span class="muted"> / 100</span></div><div><p>${esc(r.summary)}</p>${r.priority&&p.version!=='vision_score_v2'?`<p class="next-focus"><strong>Next session</strong> ${esc(r.priority)}</p>`:''}${p.score==null||p.sample_scope==='short'||p.version==='vision_score_v2'?`<span class="fine">${esc(p.note)}</span>`:''}</div></section>
+    <div class="view-tabs"><button data-report-tab="review">Review</button><button data-report-tab="breakdown" aria-pressed="true">Breakdown</button></div>
     <dl class="performance-metrics">${p.components.map(c=>`<div><dt>${esc(c.name)} <span>${Math.round(c.weight*100)}%</span></dt><dd>${num(c.value)}<small>/ 100</small></dd><span class="fine">${c.observations} observations</span></div>`).join('')}</dl>
-    <div class="clip-totals"><span>${p.observed_shots} assessed shots</span><span>${r.rallies.length} ${r.rallies.length===1?'rally':'rallies'}</span>${counts.map(([type,n])=>`<span>${n} ${esc(type)}${n===1?'':'s'}</span>`).join('')}</div>
-    ${replayView(r)}
+    <div class="clip-totals"><span>${p.observed_shots} assessed shots</span><span>${r.rallies.length} ${r.rallies.length===1?'rally':'rallies'}</span>${!r.shot_breakdown?.length?counts.map(([type,n])=>`<span>${n} ${esc(type)}${n===1?'':'s'}</span>`).join(''):''}</div>
+    ${r.shot_breakdown?.length?`<section class="shot-breakdown"><h2>Shot control by type</h2><table><thead><tr><th scope="col">Shot</th><th scope="col">Assessed</th><th scope="col">Controlled</th><th scope="col">Neutral</th><th scope="col">Errors</th></tr></thead><tbody>${r.shot_breakdown.map(s=>`<tr><th scope="row">${esc(capital(s.type))}</th><td>${Number(s.assessed)}</td><td>${Number(s.controlled)}</td><td>${Number(s.neutral)}</td><td>${Number(s.errors)}</td></tr>`).join('')}</tbody></table></section>`:''}
+    ${assessmentCoverage(r)}
     ${recordingIssue?`<p class="recording-note">${esc(r.recording_note)}</p>`:''}
-    <button class="text-button score-method-button" data-action="score-method">About this score</button>
-    <dialog id="score-method-dialog" class="report-dialog" aria-labelledby="score-method-title"><div class="report-dialog-head"><h2 id="score-method-title">About this score</h2><button type="button" class="dialog-close" data-action="close-dialog" aria-label="Close">&times;</button></div><p>Vision score combines observed shot control (50%), balance (25%), and recovery (25%). Clear, purposeful placement scores highest; neutral play scores midway; visible errors score lowest. Unclear observations are excluded.</p><p>The score uses up to 40 visible contacts and is based on this clip. Saved scores stay fixed when the scoring method changes.</p></dialog>`;
+    ${scoreMethod(r)}`;
 }
 
 function evidenceView(r) {
@@ -283,9 +280,11 @@ function reviewMedia(r) {
 
 function shotAssessment(shot) {
   if(!shot)return '';
+  if(shot.player_visible===false)return '<p class="fine">The selected player was not tracked at this time.</p>';
+  if(shot.scored===false)return '<p class="fine">This moment was not included in the score.</p>';
   if(shot.confidence==='low')return '<p class="fine">This moment is too unclear for a reliable assessment.</p>';
   const control={controlled:'Purposeful placement',neutral:'Neutral play',error:'Visible error',unknown:'Not assessed'};
-  return `<dl class="moment-assessment"><div><dt>Shot control</dt><dd>${control[shot.control]||'Not assessed'}</dd></div><div><dt>Balance</dt><dd>${shot.balanced==null?'Not assessed':shot.balanced?'Stable':'Off balance'}</dd></div><div><dt>Recovery</dt><dd>${shot.recovered==null?'Not assessed':shot.recovered?'Ready':'Late'}</dd></div></dl>`;
+  return `${shot.evidence?`<p class="shot-evidence">${esc(shot.evidence)}</p>`:'' }<dl class="moment-assessment"><div><dt>Shot control</dt><dd>${control[shot.control]||'Not assessed'}</dd></div><div><dt>Balance</dt><dd>${shot.balanced==null?'Not assessed':shot.balanced?'Stable':'Off balance'}</dd></div><div><dt>Recovery</dt><dd>${shot.recovered==null?'Not assessed':shot.recovered?'Ready':'Late'}</dd></div></dl>`;
 }
 
 function replayView(r) {
@@ -299,7 +298,7 @@ function replayView(r) {
     <div class="review-workspace"><div class="review-main"><div class="review-stage">${media?media.video?`<div class="review-media"><video id="replay-video" data-video-id="${esc(state.selectedId)}" src="${esc(media.url)}" controls controlslist="nofullscreen nodownload noremoteplayback" disablepictureinpicture playsinline preload="auto" aria-label="Gameplay review"></video><canvas id="tracking-overlay" aria-hidden="true"></canvas></div>`:`<img class="tracked-still" src="${esc(media.url)}" alt="Selected player highlighted in the saved report frame">`:'<div class="review-empty">Open your video to review this session.</div>'}</div>
     <div class="review-context"><span id="tracking-status">${media?.video?canTrack?'Selected player':'Original video':media?'Tracked frame':''}</span><time id="review-clock">${media?timestamp(media.offset):''}</time>${media?.video?'<button class="text-button" data-action="review-fullscreen" title="Expand video">Expand</button>':''}</div>
     <div id="moment-assessment">${shotAssessment(selected)}</div><p id="replay-status" class="fine" role="status"></p>${evidenceView(r)}</div>
-    <aside class="review-index"><label for="shot-filter">Shots</label><select id="shot-filter"><option value="all">All shots (${shots.length})</option>${types.map(type=>`<option value="${esc(type)}" ${v.filter===type?'selected':''}>${esc(capital(type))} (${shots.filter(s=>s.shot_type===type).length})</option>`).join('')}</select><ol class="event-list review-events">${filtered.map(s=>`<li class="${selected===s?'selected':''}"><button class="shot-event" data-seek="${s.timestamp}"><time>${timestamp(s.timestamp)}</time><span><strong>${esc(capital(s.shot_type))}</strong><small>${s.confidence==='low'?'Uncertain observation':s.control==='error'?'Visible error':s.recovered===false?'Late recovery':s.balanced===false?'Off balance':'Review shot'}</small></span></button></li>`).join('')}</ol>${!filtered.length?'<p class="fine">No shots in this view.</p>':''}
+    <aside class="review-index"><label for="shot-filter">Shots</label><select id="shot-filter"><option value="all">All shots (${shots.length})</option>${types.map(type=>`<option value="${esc(type)}" ${v.filter===type?'selected':''}>${esc(capital(type))} (${shots.filter(s=>s.shot_type===type).length})</option>`).join('')}</select><ol class="event-list review-events">${filtered.map(s=>`<li class="${selected===s?'selected':''}"><button class="shot-event" data-seek="${s.timestamp}"><time>${timestamp(s.timestamp)}</time><span><strong>${esc(capital(s.shot_type))}</strong><small>${s.player_visible===false?'Player not tracked':s.confidence==='low'?'Uncertain observation':s.control==='error'?'Visible error':s.recovered===false?'Late recovery':s.balanced===false?'Off balance':'Review shot'}</small></span></button></li>`).join('')}</ol>${!filtered.length?'<p class="fine">No shots in this view.</p>':''}
     ${(r.rallies||[]).length?`<div class="rally-jumps">${r.rallies.map((r,i)=>`<button class="text-button" data-seek="${r.start}" title="Review rally ${i+1}">Rally ${i+1} <time>${timestamp(r.start)} &ndash; ${timestamp(r.end)}</time></button>`).join('')}</div>`:''}</aside></div></section>`;
 }
 
@@ -433,8 +432,8 @@ function render() {
   cancelAnimationFrame(overlayAnimation);overlayResize?.disconnect();
   const previousVideo=document.getElementById('replay-video');
   const previousScroll=document.querySelector('.calendar-scroll')?.scrollLeft;
-  document.title=state.user?`${({home:'Overview',analyze:'Analyze',players:'Players',profile:'Account'})[state.page]} | DUPRVision`:'DUPRVision';
-  app.innerHTML=state.user?shell(state.selectedId?detailView():({home:homeView,analyze:analyzeView,players:playersView,profile:profileView}[state.page])()):authView();
+  document.title=state.user?`${({home:'Analyze',analyze:'Analyze video',schedule:'Events',players:'Players',profile:'Account',competition:'Round robin'})[state.page]} | DUPRVision`:'DUPRVision';
+  app.innerHTML=state.user?shell(state.selectedId?detailView():({home:homeView,analyze:analyzeView,schedule:scheduleView,players:playersView,profile:profileView,competition:competitionView}[state.page])()):authView();
   let video=document.getElementById('replay-video');
   if(video&&previousVideo?.getAttribute('src')===video.getAttribute('src')) {video.replaceWith(previousVideo);video=previousVideo;}
   if(video)setupReview(video);
@@ -442,7 +441,7 @@ function render() {
   if(preview) {
     const fitPreview=()=>{
       if(!preview.naturalWidth||!preview.naturalHeight)return;
-      const scale=Math.min(900/preview.naturalWidth,(window.innerWidth-40)/preview.naturalWidth,Math.min(600,window.innerHeight*.65)/preview.naturalHeight);
+      const scale=Math.min(1,preview.parentElement.parentElement.clientWidth/preview.naturalWidth,Math.min(540,window.innerHeight*.6)/preview.naturalHeight);
       preview.parentElement.style.width=`${Math.round(preview.naturalWidth*scale)}px`;
       preview.style.visibility='visible';
     };
@@ -459,6 +458,7 @@ function render() {
 app.addEventListener('click', async event=>{
   const target=event.target.closest('button, #preview-image');
   if (!target) return;
+  if(Object.keys(target.dataset).some(key=>key.startsWith('plan')||key.startsWith('comp')||/^play[A-Z]/.test(key)))return;
   if (target.type === 'submit' && target.closest('form')) return;
   state.error=''; state.notice='';
   try {
@@ -483,16 +483,15 @@ app.addEventListener('click', async event=>{
     }
     if(target.dataset.seek!==undefined){seekReplay(Number(target.dataset.seek));return;}
     if (target.dataset.page) {
-      pendingSeek=null;replayRequest++;
-      state.page=target.dataset.page; state.selectedId=null; state.player=null; state.year=null; state.day=null;
-      if(state.page==='players') await loadPlayers();
-      render(); window.scrollTo(0,0); return;
+      await navigateTo(target.dataset.page);return;
     }
+    if(target.dataset.videoView){state.videoView=target.dataset.videoView;state.day=null;render();return;}
+    if(target.dataset.reportTab){state.reportTab=target.dataset.reportTab;render();return;}
     if (target.dataset.people) {
       Object.assign(state,{page:'players',playerView:target.dataset.people,offset:0,player:null,selectedId:null,search:''});
       await loadPlayers(); render(); return;
     }
-    if (target.dataset.player) { state.player=await api(`/players/${target.dataset.player}`); state.year=null; state.day=null; render(); return; }
+    if (target.dataset.player) { state.player=await api(`/players/${target.dataset.player}`); state.year=null; state.day=null;pushRoute('player/'+target.dataset.player); render(); return; }
     if (target.dataset.follow) {
       target.disabled=true;
       await api(`/players/${target.dataset.follow}/follow`,{method:target.dataset.following==='true'?'DELETE':'POST'});
@@ -500,10 +499,11 @@ app.addEventListener('click', async event=>{
       await loadPlayers(); await refresh(); return;
     }
     if (target.dataset.day) { state.day=target.dataset.day; render(); return; }
-    if (target.dataset.video) { pendingSeek=null;replayRequest++;Object.assign(state,{selectedId:target.dataset.video,preview:1,point:null,consent:false,externalConsent:false});render();window.scrollTo(0,0);return; }
+    if (target.dataset.video) { pendingSeek=null;replayRequest++;Object.assign(state,{page:'home',selectedId:target.dataset.video,preview:1,point:null,consent:false,externalConsent:false,reportTab:'review'});pushRoute('video/'+target.dataset.video);render();window.scrollTo(0,0);return; }
     if (target.dataset.preview) {state.preview=Number(target.dataset.preview);state.point=null;render();return;}
     if (target.id==='preview-image') {const rect=target.getBoundingClientRect();state.point={x:(event.clientX-rect.left)/rect.width,y:(event.clientY-rect.top)/rect.height};render();return;}
     switch(target.dataset.action) {
+      case 'explain-average':explainAverage();return;
       case 'full-replay':viewer.source='original';pendingSeek=null;render();return;
       case 'review-fullscreen':
         if(document.fullscreenElement)await document.exitFullscreen();
@@ -524,11 +524,11 @@ app.addEventListener('click', async event=>{
       case 'auth-toggle':state.authMode=state.authMode==='login'?'register':'login';break;
       case 'choose-video':document.getElementById('video-input').click();return;
       case 'clear-day':state.day=null;break;
-      case 'back-clips':pendingSeek=null;replayRequest++;state.selectedId=null;state.page='home';break;
-      case 'back-players':state.player=null;state.day=null;state.year=null;await loadPlayers();break;
+      case 'back-clips':await navigateTo('home');return;
+      case 'back-players':await navigateTo('players');return;
       case 'next-players':state.offset+=30;await loadPlayers();break;
       case 'previous-players':state.offset=Math.max(0,state.offset-30);await loadPlayers();break;
-      case 'logout':await api('/logout',{method:'POST'});state.page='home';await refresh();return;
+      case 'logout':await api('/logout',{method:'POST'});state.page='home';state.routeReady=false;pushRoute('videos');await refresh();return;
       case 'start-analysis': {
         const v=state.videos.find(v=>v.id===state.selectedId);target.disabled=true;
         await api(`/videos/${v.id}/select`,jsonRequest('POST',{timestamp_seconds:v.duration_seconds*[.1,.4,.7][state.preview-1],...state.point,consent:state.consent,external_consent:state.externalConsent,save_evidence:state.saveEvidence,save_clips:state.saveEvidence}));
@@ -540,7 +540,7 @@ app.addEventListener('click', async event=>{
         await api(`/videos/${state.selectedId}/reselect`,{method:'POST'});state.point=null;state.consent=false;state.externalConsent=false;await refresh();return;
       case 'delete-video':
         if(!confirm('Permanently delete this clip and its result? The daily score will be recalculated. Upload allowance will not reset.'))return;
-        await api(`/videos/${state.selectedId}`,{method:'DELETE'});noteDrafts.delete(state.selectedId);noteOpen.delete(state.selectedId);clearTimeout(noteTimers.get(state.selectedId));if(replay?.id===state.selectedId)clearReplay();state.selectedId=null;state.page='home';await refresh();return;
+        await api(`/videos/${state.selectedId}`,{method:'DELETE'});noteDrafts.delete(state.selectedId);noteOpen.delete(state.selectedId);clearTimeout(noteTimers.get(state.selectedId));if(replay?.id===state.selectedId)clearReplay();state.selectedId=null;state.page='home';pushRoute('videos');await refresh();return;
     }
     render();
   } catch(error) {state.error=error.message;render();}
@@ -611,13 +611,6 @@ async function persistNote(id) {
 
 app.addEventListener('input',event=>{
   if(event.target.id==='session-note'){saveNoteDraft();return;}
-  if(!['point-x','point-y'].includes(event.target.id))return;
-  state.point={x:Math.max(0,Math.min(100,Number(document.getElementById('point-x').value)))/100,y:Math.max(0,Math.min(100,Number(document.getElementById('point-y').value)))/100};
-  let marker=document.querySelector('.point');
-  if(!marker){marker=document.createElement('span');marker.className='point';marker.textContent='+';marker.setAttribute('aria-hidden','true');document.querySelector('.preview-wrap').append(marker);}
-  marker.style.left=`${state.point.x*100}%`;marker.style.top=`${state.point.y*100}%`;
-  document.querySelector('.selection-coordinates>span').textContent='Player selected';
-  document.querySelector('[data-action="start-analysis"]').disabled=!canAnalyze();
 });
 
 function upload(file) {
@@ -626,7 +619,7 @@ function upload(file) {
   state.busy=true;state.uploadProgress=0;state.error='';render();
   const xhr=new XMLHttpRequest();xhr.open('POST','/api/videos');xhr.setRequestHeader('X-Filename',encodeURIComponent(file.name));
   xhr.upload.onprogress=event=>{if(event.lengthComputable){state.uploadProgress=Math.round(event.loaded/event.total*100);const progress=document.querySelector('progress');if(progress)progress.value=state.uploadProgress;const label=document.getElementById('upload-percent');if(label)label.textContent=`${state.uploadProgress}%`;}};
-  xhr.onload=async()=>{state.busy=false;try{const result=JSON.parse(xhr.responseText);if(xhr.status>=400)throw new Error(result.detail||'Upload failed');useReplay(file,result.id,true);state.selectedId=result.id;state.preview=1;state.point=null;state.consent=false;state.externalConsent=false;await refresh();}catch(error){state.error=error.message;render();}};
+  xhr.onload=async()=>{state.busy=false;try{const result=JSON.parse(xhr.responseText);if(xhr.status>=400)throw new Error(result.detail||'Upload failed');useReplay(file,result.id,true);state.selectedId=result.id;state.page='home';pushRoute('video/'+result.id);state.preview=1;state.point=null;state.consent=false;state.externalConsent=false;await refresh();}catch(error){state.error=error.message;render();}};
   xhr.onerror=()=>{state.busy=false;state.error='Connection lost during upload.';render();};xhr.send(file);
 }
 
@@ -639,7 +632,7 @@ window.addEventListener('resize',()=>{
 setInterval(async()=>{
   if(polling||!state.user||state.busy||!state.videos.some(v=>['PROCESSING','PREPARING','QUEUED','ANALYZING','RETRY_WAIT'].includes(v.status)))return;
   polling=true;
-  try {const active=document.activeElement;const editing=active&&['INPUT','SELECT','TEXTAREA'].includes(active.tagName);const viewingReport=state.videos.some(v=>v.id===state.selectedId&&v.status==='COMPLETED');await refresh(!editing&&!viewingReport&&!connectionDialog&&state.page!=='profile');}
+  try {const active=document.activeElement;const editing=active&&['INPUT','SELECT','TEXTAREA'].includes(active.tagName);const viewingReport=state.videos.some(v=>v.id===state.selectedId&&v.status==='COMPLETED');await refresh(!editing&&!viewingReport&&!connectionDialog&&!planDialog&&state.page!=='profile');}
   finally {polling=false;}
 },3000);
-refresh();
+document.addEventListener('DOMContentLoaded',()=>refresh(),{once:true});

@@ -1,0 +1,28 @@
+.analysis-steps{display:flex;list-style:none;padding:0 0 24px;margin:0;gap:28px;color:var(--muted);font-size:12px}
+.analysis-steps li{display:flex;align-items:center;gap:8px}
+.analysis-steps li>span{display:grid;place-items:center;width:22px;height:22px;border:1px solid #d8dde1;border-radius:50%;font-size:11px;font-variant-numeric:tabular-nums}
+.analysis-steps .reached{color:#26312e}.analysis-steps [aria-current=step]>span{background:#26312e;color:white;border-color:#26312e}
+.analysis-upload{display:flex;align-items:center;justify-content:space-between;gap:24px;flex-wrap:wrap;padding:36px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.analysis-upload h2{font-size:18px;font-weight:600;margin:0 0 8px}.analysis-upload .primary{gap:9px}
+.analysis-upload-progress{flex-basis:100%;display:flex;align-items:center;gap:16px;font-size:12px;font-variant-numeric:tabular-nums}.analysis-upload progress{flex:1;min-width:0;height:6px;accent-color:#327657}
+.player-selection{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:36px;border-top:1px solid var(--line);padding-top:24px;align-items:start}
+.selection-visual{min-width:0}.selection-stage{display:flex;align-items:center;justify-content:center;background:#f3f5f4;min-height:220px;border-radius:6px;overflow:hidden}
+.selection-stage .preview-wrap{max-width:100%;margin:0}.selection-stage .preview-wrap img{display:block}
+.frame-picker{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:14px}
+.frame-picker button{padding:4px;border:1px solid transparent;border-radius:6px;display:block;min-width:0;background:#f5f6f5}
+.frame-picker button[aria-pressed=true]{border-color:#327657;background:#e9f2ec}
+.frame-picker img{display:block;width:100%;height:64px;object-fit:contain;background:#e8ece9;border-radius:3px}
+.frame-picker time{display:block;font-size:11px;font-variant-numeric:tabular-nums;margin-top:6px;padding-bottom:2px;color:#46534c}
+.selection-status{font-size:14px;font-weight:600;padding:0 0 20px;border-bottom:1px solid var(--line)}
+.selection-options fieldset{min-width:0;margin:24px 0 0;padding:0 0 24px;border:0;border-bottom:1px solid var(--line)}
+.selection-options legend{font-size:12px;font-weight:600;padding:0;margin-bottom:16px}
+.selection-options .checkbox{align-items:flex-start;line-height:1.6;margin:0 0 14px;font-size:13px}
+.selection-options .checkbox input{flex:0 0 auto;margin:4px 0 0}.selection-options .fine{font-size:11px;line-height:1.65;margin:0}
+.selection-actions{display:flex;gap:12px;margin-top:24px}.selection-actions>.primary{flex:1}.selection-actions>.icon-button{flex:0 0 42px}
+.assessment-coverage{padding:0 0 24px;border-bottom:1px solid var(--line);margin-bottom:24px}
+.assessment-coverage h2{font-size:15px;font-weight:600;margin:0 0 16px}.assessment-coverage dl{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:20px;margin:0}
+.assessment-coverage dt{font-size:12px;font-weight:500}.assessment-coverage dd{margin:7px 0 0;font-size:12px;color:var(--muted)}
+.shot-evidence{margin:12px 0;font-size:13px;line-height:1.65}
+.practice-focus{display:grid;grid-template-columns:180px minmax(0,1fr);gap:32px;padding:22px 0;border-bottom:1px solid var(--line);margin-bottom:24px}.practice-focus h2{font-size:15px;font-weight:600;margin:6px 0 0}.practice-focus p{font-size:13px;line-height:1.7;margin:0}.practice-moments{display:flex;gap:18px;margin-top:8px}.practice-moments button{font-variant-numeric:tabular-nums;font-size:12px}
+@media(max-width:800px){.player-selection{grid-template-columns:minmax(0,1fr);gap:24px}.selection-stage{min-height:180px}.selection-options{max-width:none}.selection-options fieldset{margin-top:20px;padding-bottom:18px}.frame-picker img{height:56px}}
+@media(max-width:560px){.analysis-steps{gap:20px;padding-bottom:20px;font-size:11px}.analysis-upload{padding:26px 0;gap:20px}.analysis-upload>.primary{width:100%}.assessment-coverage dl{grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 16px}.player-selection{padding-top:18px}.selection-stage{min-height:160px}.practice-focus{grid-template-columns:1fr;gap:12px}}

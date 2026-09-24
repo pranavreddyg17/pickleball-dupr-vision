@@ -14,7 +14,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
 LOG = ROOT / "data" / "public.log"
-PUBLIC_URL = "https://pickle.duprvision.workers.dev"
 LOCAL_HEALTH = "http://127.0.0.1:3000/api/health"
 TUNNEL_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 stopping = threading.Event()

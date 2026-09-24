@@ -7,7 +7,7 @@ import pytest
 
 from duprvision import core, review, worker
 from duprvision.performance import validate_performance
-from test_flow import clients, add_result, compact_review
+from test_flow import add_result, compact_review, compact_assessment
 
 
 def test_deterministic_score_and_missing_evidence():
@@ -53,7 +53,16 @@ def prepare_provider(clients, monkeypatch, responses):
 
 
 def success():
-    return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(compact_review())}]}}]})
+    return httpx.Response(200,json={'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':json.dumps(compact_assessment())}]}}]})
+
+
+def test_default_review_has_no_high_detail_cost_increase(clients, monkeypatch):
+    row, selection, calls = prepare_provider(clients, monkeypatch, [success()])
+    result = review.gemini_review(row, selection, True)
+    config = calls[0]['json']['generationConfig']
+    assert 'mediaResolution' not in config
+    assert result['review_input'] == {'fps':5, 'detail':'default', 'player_marked':False}
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize('failure',[httpx.Response(503),httpx.Response(429),httpx.ReadTimeout('timeout'),httpx.Response(200,json={})])
@@ -62,7 +71,7 @@ def test_transient_failure_recovers(clients,monkeypatch,failure):
     with pytest.raises(review.RetryableReviewError):
         review.gemini_review(row,selection,True)
     assert len(calls)==1
-    assert review.gemini_review(row,selection,True)['performance']['score']==63
+    assert review.gemini_review(row,selection,True)['performance']['score']==54
     assert len(calls)==2
     with core.connect() as db:
         assert [r[0] for r in db.execute('SELECT status FROM provider_requests ORDER BY id')]==['retryable','succeeded']
@@ -84,7 +93,7 @@ def test_outage_is_bounded_and_manual_retry_works(clients,monkeypatch):
         with pytest.raises(review.RetryableReviewError):
             review.gemini_review(row,selection,True)
     assert len(calls)==3
-    assert review.gemini_review(row,selection,True)['performance']['score']==63
+    assert review.gemini_review(row,selection,True)['performance']['score']==54
     assert len(calls)==4
 
 
@@ -159,12 +168,4 @@ def test_legacy_rating_never_mixed_with_performance(clients):
     history=a.get('/api/scores').json()
     assert history['average']==70
     assert history['clips']==2 and history['rated_clips']==1
-    assert history['dupr_equivalent']==4.1
-
-
-def test_dupr_equivalent_is_bounded_and_missing_stays_missing():
-    assert core.dupr_scale_equivalent(None) is None
-    assert core.dupr_scale_equivalent(0)==2.0
-    assert core.dupr_scale_equivalent(50)==3.5
-    assert core.dupr_scale_equivalent(100)==5.0
-    assert core.dupr_scale_equivalent(120)==5.0
+    assert 'dupr_equivalent' not in history

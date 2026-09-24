@@ -1,6 +1,7 @@
 """Opt-in real model smoke test. A still image is not skill-validation footage."""
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,8 +20,10 @@ def test_real_pose_pipeline_expires_media(tmp_path, monkeypatch):
     monkeypatch.setenv("INVITE_CODE", "")
     monkeypatch.setenv("ANALYSIS_ENGINE", "local")
     source = tmp_path / "still.mp4"
+    reference = Path(os.environ.get('DUPRVISION_POSE_IMAGE', ''))
+    assert reference.is_file(), 'Set DUPRVISION_POSE_IMAGE to a consented player image'
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-loop", "1",
-                    "-i", str(core.ROOT / "static/court.png"), "-t", "60", "-vf",
+                    "-i", str(reference), "-t", "60", "-vf",
                     "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
                     "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(source)], check=True)
     with TestClient(web.app) as client:

@@ -15,7 +15,8 @@ from zoneinfo import ZoneInfo
 from .core import DATA, ROOT, cleanup_media, connect, expire_media, init_db, iso, now, video_dir
 from .evidence import build_evidence, marked_reference, serialize_track, track_player
 from .pose_review import build_pose_review
-from .review import gemini_review, RetryableReviewError
+from .quality import capture_quality, reconcile_track
+from .review import gemini_review, self_hosted_review, RetryableReviewError
 
 SAMPLE_HZ = 5
 TRACK_HZ = 15
@@ -36,8 +37,8 @@ def normalize(row):
     folder = video_dir(row["id"])
     output = folder / "normalized.mp4"
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", row["raw_path"],
-               "-map", "0:v:0", "-vf", "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
-               "-an", "-c:v", "libx264", "-threads", "1", "-preset", "veryfast", "-crf", "27", "-movflags", "+faststart", str(output)]
+               "-map", "0:v:0", "-vf", "scale=w='if(gte(iw,ih),min(iw,1280),min(iw,720))':h='if(gte(iw,ih),min(ih,720),min(ih,1280))':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
+               "-an", "-c:v", "libx264", "-threads", "1", "-preset", "veryfast", "-crf", "23", "-movflags", "+faststart", str(output)]
     process = subprocess.run(command, capture_output=True, text=True, timeout=600)
     if process.returncode or not output.exists():
         raise RuntimeError("This video could not be converted. Try an MP4 or MOV file.")
@@ -180,24 +181,37 @@ def process(row):
                 evidence_preference = db.execute("SELECT enabled,keep_clips FROM evidence_preferences WHERE video_id=?", (row["id"],)).fetchone()
             if not selection:
                 raise RuntimeError("Player selection is missing")
+            if options and options['engine'] == 'limited':
+                # Old local-only jobs did not necessarily authorize external processing.
+                update(row['id'], status='WAITING_FOR_PLAYER', stage='Choose your player for shot review')
+                return
+            quality = capture_quality(row['normalized_path'])
             tracked = None
             reference = None
-            if evidence_preference and evidence_preference["enabled"] and options and options["engine"] == "gemini":
+            if options and options["engine"] in ("gemini", "self_hosted"):
                 try:
                     with LOCAL_MODEL_LOCK:
                         tracked = track_player(row, selection)
                     reference = marked_reference(row, selection, tracked)
                 except Exception as exc:
                     print(f"Player tracking unavailable for {row['id']}: {type(exc).__name__}", flush=True)
-            if options and options["engine"] == "gemini":
+            if options and options["engine"] in ("gemini", "self_hosted"):
                 update(row["id"], stage="Reviewing shots and rallies")
-                result = gemini_review(row, selection, bool(options["external_consent"]), reference)
+                if options["engine"] == "gemini":
+                    result = gemini_review(row, selection, bool(options["external_consent"]), reference, tracked)
+                else:
+                    result = self_hosted_review(row, selection, reference, tracked)
             else:
                 with LOCAL_MODEL_LOCK:
                     result = track_and_analyze(row, selection)
             # Cached observations may be reused, but media always belongs to this upload.
             result.pop('evidence', None)
             result.pop('player_track', None)
+            result.pop('tracking_check', None)
+            result.pop('capture_quality', None)
+            result['capture_quality'] = quality
+            if tracked is not None:
+                result = reconcile_track(result, tracked, row['duration_seconds'])
             if evidence_preference and evidence_preference["enabled"]:
                 update(row["id"], stage="Preparing key moments")
                 try:
@@ -205,6 +219,8 @@ def process(row):
                         if tracked is None:
                             tracked = track_player(row, selection)
                     result['player_track'] = serialize_track(row, tracked)
+                    if options and options['engine'] not in ('gemini', 'self_hosted'):
+                        result = reconcile_track(result, tracked, row['duration_seconds'])
                     result["evidence"] = build_evidence(row, result, tracked, bool(evidence_preference['keep_clips']))
                 except Exception as exc:
                     print(f"Snapshot rendering failed for {row['id']}: {type(exc).__name__}", flush=True)
@@ -221,7 +237,7 @@ def process(row):
             due = iso(now() + timedelta(seconds=delay))
             # Respect provider cooldown globally; malformed responses affect only this job.
             if exc.code.startswith("HTTP_") or "Timeout" in exc.code or "Connect" in exc.code:
-                db.execute("INSERT INTO provider_health VALUES ('gemini',?) ON CONFLICT(name) DO UPDATE SET cooldown_until=MAX(cooldown_until,excluded.cooldown_until)", (due,))
+                db.execute("INSERT INTO provider_health VALUES (?,?) ON CONFLICT(name) DO UPDATE SET cooldown_until=MAX(cooldown_until,excluded.cooldown_until)", (options['engine'], due))
             retry = retries < (1 if exc.code in ('INVALID_RESPONSE', 'INCOMPLETE_RESPONSE') else 2) and delay <= 600
             invalid = exc.code in ('INVALID_RESPONSE', 'INCOMPLETE_RESPONSE')
             message = ("The provider returned an incomplete report. Retrying automatically." if retry else
@@ -248,14 +264,17 @@ def process(row):
 def claim_next():
     with connect(immediate=True) as db:
         capacity = max(1, min(3, int(os.getenv("PROVIDER_CONCURRENCY", "1"))))
-        busy = db.execute("SELECT COUNT(*) FROM videos JOIN analysis_options ON id=video_id WHERE status='ANALYZING' AND engine='gemini'").fetchone()[0]
-        cooling = db.execute("SELECT 1 FROM provider_health WHERE name='gemini' AND cooldown_until>?", (iso(),)).fetchone()
+        busy = db.execute("SELECT COUNT(*) FROM videos JOIN analysis_options ON id=video_id WHERE status='ANALYZING' AND engine IN ('gemini','self_hosted')").fetchone()[0]
+        cooling = {name for (name,) in db.execute("SELECT name FROM provider_health WHERE cooldown_until>?", (iso(),))}
         row = db.execute("""SELECT v.* FROM videos v
             LEFT JOIN analysis_options o ON o.video_id=v.id
             LEFT JOIN analysis_jobs j ON j.video_id=v.id
             WHERE (v.status IN ('PROCESSING','QUEUED') OR (v.status='RETRY_WAIT' AND j.next_attempt_at<=?))
-            AND (v.status='PROCESSING' OR COALESCE(o.engine,'local')!='gemini' OR ?)
-            ORDER BY v.created_at LIMIT 1""", (iso(), int(busy < capacity and not cooling))).fetchone()
+            AND (v.status='PROCESSING' OR COALESCE(o.engine,'local') NOT IN ('gemini','self_hosted')
+                 OR (? AND ((o.engine='gemini' AND NOT ?) OR
+                            (o.engine='self_hosted' AND NOT ?))))
+            ORDER BY v.created_at LIMIT 1""", (iso(), int(busy < capacity),
+                                               int('gemini' in cooling), int('self_hosted' in cooling))).fetchone()
         if row:
             db.execute("UPDATE videos SET status=?, updated_at=? WHERE id=?", (
                 "PREPARING" if row["status"] == "PROCESSING" else "ANALYZING", iso(), row["id"]

@@ -62,7 +62,6 @@ try {
   }
   assert.equal(await page.evaluate(()=>trackingBox([[0,.1,.2,.3,.4],[1,.2,.3,.4,.5]],.5)),null,'Never interpolate through tracking gaps');
   await page.reload();
-  await page.locator('.session-row[data-video="qa-local-0"]').click();
   await page.waitForFunction(()=>document.getElementById('replay-video')?.readyState>=2);
   assert.equal(await page.evaluate(()=>replay),null);
   assert.match(await video.getAttribute('src'),/\/evidence\/1\/clip$/);
@@ -73,7 +72,6 @@ try {
     await route.fulfill({response,json:rows});
   });
   await page.reload();
-  await page.locator('.session-row[data-video="qa-local-0"]').click();
   await page.locator('[data-moment="2"]').click();
   await page.waitForFunction(()=>document.querySelector('.tracked-still')?.naturalWidth>0);
   assert.match(await page.locator('.tracked-still').getAttribute('src'),/\/evidence\/2$/);

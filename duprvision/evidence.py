@@ -1,6 +1,7 @@
 """Private report frames and replays from a local, sequential player track."""
 
 import math
+import bisect
 import os
 import subprocess
 from pathlib import Path
@@ -117,6 +118,54 @@ def draw_box(frame, box):
     return canvas
 
 
+def review_track_video(row, tracked, path):
+    """Mark the tracked subject at review cadence, without bridging tracking gaps."""
+    import cv2
+
+    if not tracked:
+        return False
+    capture = cv2.VideoCapture(row['normalized_path'])
+    width = round(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+    if not capture.isOpened() or not width or not height or not fps or not frames:
+        capture.release()
+        return False
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'mp4v'), 5, (width, height))
+    times = [sample[0] for sample in tracked]
+    complete = False
+    try:
+        if not writer.isOpened():
+            return False
+        # Container duration may include a partial final frame beyond decoded video.
+        duration = min(float(row['duration_seconds']), frames / fps)
+        frame_index = -1
+        for index in range(math.ceil(duration * 5 - 1e-8)):
+            timestamp = index / 5
+            target = min(int(frames) - 1, round(timestamp * fps))
+            while frame_index < target:
+                if not capture.grab():
+                    return False
+                frame_index += 1
+            ok, frame = capture.retrieve()
+            if not ok:
+                return False
+            at = bisect.bisect_left(times, timestamp)
+            nearest = min((i for i in (at - 1, at) if 0 <= i < len(times)),
+                          key=lambda i: abs(times[i] - timestamp))
+            if abs(times[nearest] - timestamp) <= .15:
+                frame = draw_box(frame, tracked[nearest][1])
+            writer.write(frame)
+        complete = True
+    finally:
+        capture.release()
+        writer.release()
+        if not complete:
+            path.unlink(missing_ok=True)
+    return complete and path.is_file() and path.stat().st_size > 0
+
+
 def serialize_track(row, tracked):
     import cv2
 
@@ -142,7 +191,7 @@ def save_replay(row, timestamp, number):
     try:
         subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
                         '-ss', str(start), '-i', row['normalized_path'], '-t', str(end - start),
-                        '-map', '0:v:0', '-vf', "scale=w='min(iw,960)':h='min(ih,540)':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
+                        '-map', '0:v:0', '-vf', "scale=w='if(gte(iw,ih),min(iw,960),min(iw,540))':h='if(gte(iw,ih),min(ih,540),min(ih,960))':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
                         '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-threads', '1',
                         '-preset', 'veryfast', '-crf', '25', '-movflags', '+faststart', str(temporary)],
                        check=True, capture_output=True, timeout=45)

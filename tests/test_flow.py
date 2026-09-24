@@ -20,7 +20,6 @@ def test_auth_upload_quota_worker_and_delete(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "DATA", tmp_path)
     monkeypatch.setattr(core, "DB", tmp_path / "duprvision.sqlite3")
     monkeypatch.setattr(web, "DATA", tmp_path)
-    monkeypatch.setattr(web, "DB", tmp_path / "duprvision.sqlite3")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("INVITE_CODE", "")
     monkeypatch.setenv("ANALYSIS_ENGINE", "local")
@@ -59,24 +58,16 @@ def test_auth_upload_quota_worker_and_delete(tmp_path, monkeypatch):
         assert client.get("/api/scores").json()["clips"] == 1
         assert not core.video_dir(video_id).exists()
         assert client.get(f"/api/videos/{video_id}/preview/1").status_code == 410
-        assert client.get("/api/estimate").json()["profile"] is None
+        assert client.get("/api/estimate").status_code == 404
 
         for _ in range(4):
             assert client.post("/api/videos", content=source.read_bytes(), headers={"X-Filename": "match.mp4"}).status_code == 200
         assert client.post("/api/videos", content=source.read_bytes(), headers={"X-Filename": "match.mp4"}).status_code == 429
         assert client.delete(f"/api/videos/{video_id}").status_code == 200
-        assert client.get("/api/estimate").json()["profile"] is None
+        assert client.get("/api/estimate").status_code == 404
         assert client.get("/api/scores").json()["average"] is None
         assert client.get(f"/api/videos/{video_id}/preview/1").status_code == 404
         assert client.get("/api/me").json()["remaining"] == 0
-
-
-def test_aggregate_resists_one_outlier():
-    results = [{"best_estimate": value, "duration_seconds": 60} for value in (3.7, 3.6, 4.8, 3.7, 3.8)]
-    profile = core.aggregate(results)
-    assert profile["estimate"] == 3.7
-    assert profile["sessions"] == 5
-    assert profile["observed_seconds"] == 300
 
 
 def test_login_is_limited(tmp_path, monkeypatch):
@@ -115,21 +106,6 @@ def test_motion_rejects_missing_and_fragmented_tracks():
         worker.measure_motion(samples[:100], 300)
     with pytest.raises(RuntimeError, match="continuous"):
         worker.measure_motion(samples[::2], 300)
-
-
-@pytest.fixture
-def clients(tmp_path, monkeypatch):
-    monkeypatch.setattr(core, "DATA", tmp_path)
-    monkeypatch.setattr(core, "DB", tmp_path / "duprvision.sqlite3")
-    monkeypatch.setattr(web, "DATA", tmp_path)
-    monkeypatch.setenv("INVITE_CODE", "")
-    monkeypatch.setenv("APP_TIMEZONE", "America/Chicago")
-    monkeypatch.setenv("ANALYSIS_ENGINE", "local")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    with TestClient(web.app) as a, TestClient(web.app) as b:
-        for client, name in ((a,"Alice"),(b,"Bob")):
-            assert client.post("/api/register", json={"email": f"{name}@example.com", "password": "a-long-password", "display_name": name}).status_code == 200
-        yield a, b
 
 
 def add_result(user_id, video_id, score, created_at, kind="video_review_v2", score_date=None):
@@ -313,15 +289,6 @@ def test_abandoned_media_expires_but_active_job_does_not(clients):
     assert core.video_dir("running").exists()
 
 
-def valid_review():
-    return {"subject_identified":True,"ball_visible":True,
-            "summary":"The selected player used measured returns and several soft shots. Test fixture, not a real coaching assessment.",
-            "shots":[{"timestamp":t,"shot_type":"drive" if i%2 else "drop","confidence":"high","observation":"Test-only shot observation"} for i,t in enumerate((2,4,8,17,19,22,33,36))],
-            "rallies":[{"start":s,"end":e,"observation":"Test-only rally"} for s,e in ((0,12),(15,25),(30,45))],
-            "strengths":[],"priorities":[],"limitations":["Test fixture"],
-            "rating":{"estimate":3.5,"low":3.0,"high":4.0,"rationale":"Test-only supported rating range, not a real assessment."}}
-
-
 def compact_review():
     return {"subject_identified":True,"ball_visible":True,
             "summary":"Controlled kitchen play with stable contact. Recover earlier after wide shots.",
@@ -331,25 +298,11 @@ def compact_review():
             "rallies":[{"start":0,"end":40}]}
 
 
-def test_review_evidence_gates_and_timestamps():
-    from duprvision.review import validate_review
-    raw=valid_review()
-    assert validate_review(raw,60)["rating"]["estimate"] == 3.5
-    raw["ball_visible"]=False
-    r=validate_review(raw,60)
-    assert r["rating"] is None and r["shot_counts"] is None
-    assert all(s["shot_type"]=="unknown" for s in r["shots"])
-    raw=valid_review()
-    raw["shots"]=raw["shots"][:3]
-    assert validate_review(raw,60)["rating"] is None
-    raw=valid_review()
-    raw["shots"][0]["timestamp"]=90
-    with pytest.raises(RuntimeError,match="timestamps"):
-        validate_review(raw,60)
-    raw=valid_review()
-    raw["rallies"][1]["start"]=10
-    with pytest.raises(RuntimeError,match="overlapping"):
-        validate_review(raw,60)
+def compact_assessment():
+    raw = compact_review()
+    for shot in raw['shots']:
+        shot.update(pressure='routine', evidence='Soft crosscourt placement keeps the exchange neutral.')
+    return raw
 
 
 def test_gemini_requires_owner_opt_in_and_uploader_consent(monkeypatch):
@@ -383,11 +336,11 @@ def test_provider_payload_limits_and_no_automatic_duplicate(clients,monkeypatch,
         def __exit__(self,*args):pass
         def post(self,url,**kwargs):
             calls.append(kwargs)
-            return httpx.Response(200,json={"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":json.dumps(compact_review())}]}}]})
+            return httpx.Response(200,json={"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":json.dumps(compact_assessment())}]}}]})
     monkeypatch.setattr(review.httpx,"Client",Client)
     row={"id":"provider","duration_seconds":60,"normalized_path":str(folder/"normalized.mp4")}
     selection={"timestamp_seconds":6,"x":.5,"y":.5}
-    assert review.gemini_review(row,selection,True)["performance"]["score"]==63
+    assert review.gemini_review(row,selection,True)["performance"]["score"]==54
     assert len(calls)==1
     payload=calls[0]["json"]
     assert payload["generationConfig"]["maxOutputTokens"]==4096
@@ -395,7 +348,7 @@ def test_provider_payload_limits_and_no_automatic_duplicate(clients,monkeypatch,
     assert payload["generationConfig"]["thinkingConfig"] == ({"thinkingLevel":"minimal" if "flash-lite" in model else "low"} if model.startswith("gemini-3") else {"thinkingBudget":0})
     assert payload["contents"][0]["parts"][2]["videoMetadata"]["fps"]==5
     assert not (folder/"review.mp4").exists()
-    assert review.gemini_review(row,selection,True)["performance"]["score"]==63
+    assert review.gemini_review(row,selection,True)["performance"]["score"]==54
     assert len(calls)==1
     assert not (folder/"review.mp4").exists()
 
@@ -413,55 +366,3 @@ def test_pose_candidates_are_not_shot_labels_or_ratings():
     r=build_pose_review({"subject_visibility":1,"measured_seconds":59,"active_seconds":0,"median_speed":0},[],1)
     assert r["rating"] is None and r["shot_counts"] is None
     assert "drive/drop" in r["summary"]
-
-
-def test_single_rally_requires_sustained_shot_evidence_and_broad_range():
-    from duprvision.review import validate_review
-    raw = valid_review()
-    raw["rallies"] = [{"start":0,"end":40,"observation":"Test sustained rally"}]
-    raw["rating"].update(low=3.25,high=3.75)
-    result = validate_review(raw,45)
-    assert result["sample_scope"] == "short"
-    assert result["rating"]["high"] - result["rating"]["low"] >= 1
-    raw["rallies"][0]["end"] = 10
-    assert validate_review(raw,45)["rating"] is None
-
-
-def test_uncertain_shots_do_not_inflate_counts_or_rating():
-    from duprvision.review import validate_review
-    raw = valid_review()
-    for shot in raw["shots"][:4]:
-        shot["confidence"] = "low"
-    result = validate_review(raw,60)
-    assert sum(result["shot_counts"].values()) == 4
-    assert result["uncertain_shots"] == 4
-    assert result["rating"] is None
-
-
-def test_invalid_coaching_timecodes_are_not_displayed():
-    from duprvision.review import validate_review
-    raw = valid_review()
-    raw["priorities"] = ["Try an attack at 12:00.", "Aim your dinks just inside the baseline.", "Keep the paddle prepared."]
-    result = validate_review(raw,60)
-    assert result["priorities"] == ["Keep the paddle prepared."]
-
-
-def test_recording_notes_alias_and_strict_local_bounds():
-    from duprvision.review import Review, provider_schema
-    raw = valid_review()
-    raw["recording_notes"] = raw.pop("limitations")
-    assert Review.model_validate(raw).limitations == ["Test fixture"]
-    assert "recording_notes" in provider_schema()["properties"]
-    raw["shots"] *= 20
-    with pytest.raises(ValueError):
-        Review.model_validate(raw)
-
-
-@pytest.mark.parametrize("estimate,low,high", [(2,2,2.5),(8,7.5,8)])
-def test_short_sample_range_respects_scale_boundaries(estimate,low,high):
-    from duprvision.review import validate_review
-    raw = valid_review()
-    raw["rating"].update(estimate=estimate,low=low,high=high)
-    result = validate_review(raw,50)
-    assert result["rating"]["high"] - result["rating"]["low"] >= 1
-    assert 2 <= result["rating"]["low"] <= result["rating"]["high"] <= 8

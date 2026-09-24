@@ -10,6 +10,7 @@ try {
   await page.locator('#email').fill('qa-local@example.test');
   await page.locator('#password').fill('local-ui-test-2026');
   await page.getByRole('button',{name:'Sign in',exact:true}).click();
+  await page.getByRole('button',{name:'Players',exact:true}).click();
   await page.locator('[data-action="open-connections"]').waitFor();
   assert.equal((await page.request.post(base+'/api/players/qa-follow/follow')).status(),200);
   await page.reload();
@@ -30,10 +31,10 @@ try {
   await page.getByText('No followers yet.',{exact:true}).waitFor();
   await page.keyboard.press('Escape');
   assert.equal(await page.evaluate(()=>document.activeElement?.dataset.action),'open-connections');
-  assert.equal(await page.locator('.nav-item[aria-current="page"]').innerText(),'Overview');
-  for(const [key,title] of [['analyze','Analyze'],['players','Players'],['profile','Account']]) {
+  assert.equal(await page.locator('.nav-item[aria-current="page"]').innerText(),'Players');
+  for(const [key,selector] of [['home','.workspace-toolbar'],['players','#search-form'],['profile','#profile-form']]) {
     await page.locator(`[data-page="${key}"]`).click();
-    await page.getByRole('heading',{name:title,exact:true}).waitFor();
+    await page.locator(selector).waitFor();
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
     await page.screenshot({path:`/tmp/duprvision-${key}-refined.png`,fullPage:true});
   }

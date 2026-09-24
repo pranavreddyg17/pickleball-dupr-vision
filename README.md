@@ -1,52 +1,102 @@
 # DUPRVision
 
-Video review and daily progress tracking for pickleball players.
+Review your pickleball footage, follow your progress, and organize the next game.
 
-[Watch the demo](docs/demo.mp4)
+[Watch the demo](docs/demo.mp4) · [Quick start](#quick-start) · [Analysis modes](#analysis-modes) · [Deployment](#deployment) · [Development](#development)
 
-The demo records the full app workflow with `1.mp4`: create an account, upload the clip, select a player, consent to analysis, wait for the worker, inspect the report, and review the daily calendar and player directory. This captured run scored 83/100 from nine assessed shots and one rally. The score can vary on another run; AI observations are fallible and are not a validated skill rating.
+[![A tracked replay in DUPRVision](docs/demo-preview.jpg)](docs/demo.mp4)
 
-## What it does
+## The App
 
-- Accepts MP4 and MOV gameplay clips up to 3 minutes and 100 MB, including clips shorter than a minute.
-- Lets the uploader identify the player and consent to analysis.
-- Produces a concise shot and rally review. With Gemini enabled, it scores observed shot control, balance, and recovery on a 0-100 Vision scale.
-- Tracks scored days in an activity calendar and shows a daily average. Players can opt into discovery and follow each other.
-- Deletes the full upload after a completed report while retaining the report and daily activity.
-- Replays shot and rally timestamps from the original file in your browser, with 0.25x-1x playback. Reopening a file does not upload it or trigger another analysis.
-- Presents your average and a practice takeaway without extra dashboard counters or sparse charts.
-- Opens followers and following in an in-place Connections panel with a distinct-player count.
-- Saves private session notes and timestamped report corrections without changing the score.
-- Can retain up to three private six-second replays and annotated player frames when selected before analysis; the original upload still expires.
+Three destinations keep video review, scheduling, and people separate.
 
-The profile also displays a **DUPR-scale equivalent**: `2.0 + 3.0 * Vision average / 100`, rounded to one decimal. This is an uncalibrated display conversion, not an official DUPR rating or a prediction of match results. DUPRVision is independent of DUPR.
+| Destination | What you can do |
+| --- | --- |
+| **Analyze** | Upload a clip, select a player, review shots and rallies, replay tracked moments, save private notes, and view daily progress. |
+| **Events** | Share a court and time, browse the calendar, or organize a doubles round robin with players, courts, scores, and standings. |
+| **Players** | Find discoverable players, follow their activity, and manage connections. |
 
-### Review and practice
+Account settings are available from the profile control. The responsive web app supports desktop and mobile browsers and can be added to a phone's home screen. Native App Store and Play Store packages are not included.
 
-The report opens retained moments directly, with a moving selected-player overlay, Tracked/Original switching, slow motion, frame stepping, looping, and shot filters. Tracking disappears across detection gaps instead of guessing the player's location. Older reports with snapshots open enlarged annotated frames.
+### Video Review
 
-Use **Open full video** to review the complete original in your browser without uploading it again. Shot timestamps and rally links seek to an available replay or the attached original. SHA-256 verifies reattached files for uploads made since fingerprinting was introduced. Older reports label the match unverified. Only one browser file reference is retained at a time; it is released on replacement, sign-out, or page reload. Browser codec support is required.
+- MP4, MOV, and M4V uploads, up to **100 MB and three minutes**. Short clips are accepted.
+- Three reference frames for selecting the player; permission is required before analysis.
+- Shot observations, rally timestamps, a concise summary, and a practice focus when supported by the evidence.
+- Tracked replays with slow motion, frame stepping, shot filters, and an Original view.
+- Optional retention of up to three private six-second replays and annotated frames.
+- Private notes and report corrections. Feedback does not silently change a saved score.
 
-The overview keeps the average score, latest practice takeaway, calendar, and recent sessions. Shot control, balance, and recovery remain in individual reports. **Connections** counts distinct discoverable players you follow or who follow you; mutual follows count once. Its panel opens without leaving Overview and supports filtering, following, and unfollowing. Private profiles are excluded.
+The full upload is deleted after successful review. You can reopen the original file locally in the browser for full-length playback without uploading or analyzing it again.
 
-**My notes** autosave and are visible only to the account owner. Use **Report an issue** to flag a wrong player, shot assessment, or missed moment. Feedback does not rerun analysis or alter scores. Optional **Key moments** show the locally tracked player, not ball contact or proof of a shot label. Frames and silent replays are owner-only and deleted with the report. New replay retention requires consent before analysis; expired uploads cannot be reconstructed.
+### What the Score Means
 
-## Run locally
+The **clip score is 0-100**, calculated locally from the reviewed observations: **70% shot control, 15% balance, and 15% recovery**. Confidence weighting and small-sample stabilization reduce extreme scores from a few easy shots.
 
-Requires Python 3.11, FFmpeg/FFprobe, and at least 5 GB free disk space. On macOS, install FFmpeg with `brew install ffmpeg`.
+A score requires enough observable evidence. Tracking a person alone does not establish ball contact, shot quality, or playing ability. When evidence is insufficient, the report can be available without a score.
+
+Progress averages scored days equally, excludes recognized duplicate evidence, and does not mix scoring versions. Historical reports remain readable.
+
+**This is not an official DUPR rating or a validated estimate of overall skill.** Camera angle, clip length, occlusion, and model errors affect the observations. DUPRVision is independent of DUPR.
+
+[Scoring rules and limitations](docs/scoring.md)
+
+### Events and Round Robins
+
+Create a **Play session** for open play, practice, lessons, league play, tournaments, or a DUPR match. Search for a venue, choose a map pin, or enter an unlisted location manually. Times appear in the viewer's local time zone.
+
+Ordinary plans can be private or visible to followers of a discoverable profile. This is a schedule, not live location tracking or court booking.
+
+Create a **Round robin** for rotating partners or fixed teams. Organizers can run an event without playing, invite members, add guests, manage attendance, and assign named or unnamed courts. All matches in a round must be resolved before the next round starts. Players can submit scores for opponent confirmation; organizers resolve disputes and forfeits.
+
+Events support up to 32 roster entries and eight courts. Scheduling uses a local solver, not a language model. Event results do not update DUPR or video scores.
+
+[Round-robin guide](docs/round-robin.md)
+
+## Demo
+
+[Watch the current end-to-end demo](docs/demo.mp4) (**1:43**, H.264 MP4).
+
+The recording uses both supplied clips, `1.mp4` and `2.mp4`, in an isolated demo account. It shows uploads, player selection, completed analyses, moving tracking overlays, score breakdowns, daily progress, event creation, round-robin scoring, and following another player.
+
+The actual recorded results were **64/100 from nine assessed shots** and **56/100 from three assessed shots**. These are observations from those runs, not expected results or accuracy benchmarks. Long processing and retry waits are cut; report values are unchanged. The demo includes a resumed capture after a temporary provider delay.
+
+Only the edited app recording and its preview are included here. The original gameplay files, private database, provider responses, and raw recordings are not committed.
+
+## Quick Start
+
+**Requirements:** Python 3.11, FFmpeg and FFprobe on your PATH, and sufficient disk space for Python dependencies, model weights, and temporary video processing. Start with at least 5 GB free. The supplied launch scripts target macOS/Linux; Windows requires a compatible Linux environment such as WSL.
+
+On macOS, install FFmpeg first:
+
+```sh
+brew install ffmpeg
+```
+
+From the repository root:
 
 ```sh
 ./scripts/bootstrap.sh
 ./scripts/start.sh
 ```
 
-Open <http://127.0.0.1:3000>. Bootstrap creates `.venv`, `.env`, the local database, and downloads the YOLO26 weights. Accounts and reports are stored in `data/duprvision.sqlite3`; temporary uploads live under `data/uploads/`, and opted-in frames and replays under `data/evidence/`. Both `.env` and `data` are excluded from Git.
+Open [http://127.0.0.1:3000](http://127.0.0.1:3000).
 
-### Analysis modes
+Bootstrap creates `.venv` and `.env`, installs runtime dependencies, initializes SQLite, and downloads the YOLO weights. Start launches the API and analysis worker together. There is no frontend build step; opening `static/index.html` directly does not run the app.
 
-The default `ANALYSIS_ENGINE=local` uses YOLO26 pose tracking without a paid API. It records possible stroke motions but cannot reliably identify ball contacts, shot types, outcomes, or a skill score. It leaves the Vision score empty when that evidence is unavailable.
+**The default mode is local pose review.** For shot analysis and clip scores, configure a video-review provider below, then restart.
 
-For shot and rally review, set these values in `.env` and restart the app:
+## Analysis Modes
+
+| Mode | Requires | Produces |
+| --- | --- | --- |
+| `local` | Downloaded YOLO weights; no provider key | Player visibility and possible stroke motions. **No shot-outcome score.** |
+| `gemini` | Owner's Gemini API key and uploader consent | Structured shot/rally review, followed by local validation and scoring. |
+| `self_hosted` | Your own compatible video-model server | The same review contract and scoring path, without a Gemini dependency. Quality depends on the model you operate. |
+
+### Gemini
+
+Edit `.env`:
 
 ```dotenv
 ANALYSIS_ENGINE=gemini
@@ -54,48 +104,90 @@ GEMINI_API_KEY=your-key
 GEMINI_MODEL=gemini-3.5-flash-lite
 ```
 
-Each uploader must consent before the clip and player-selection frame are sent to Google. The worker normalizes video to a silent 5-fps copy and caps the provider payload at 12 MiB. The default worker handles three concurrent jobs; local video processing is serialized. Gemini requests have a separate concurrency limit of one (`PROVIDER_CONCURRENCY`). Provider failures can still delay or prevent a report. The daily provider-attempt limit is configurable with `MAX_DAILY_VIDEO_REVIEWS` (default 20).
+The browser never receives the key. Each uploader must authorize sending the review video and selection frame to Google. The server creates a silent 5-fps review copy capped at 12 MiB, with selected-player outlines where local tracking is available.
 
-The Vision score is a clip-performance heuristic: 50% shot control, 25% balance, and 25% recovery. Unclear events are excluded, and too little evidence produces no score. It is not a calibrated skill model.
+### Self-Hosted
 
-### Recovery and reuse
-
-- Each worker invocation sends one request. Transient failures schedule up to two automatic retries in SQLite, with backoff and a shared provider cooldown. Waiting does not occupy a worker thread, and the schedule survives restarts.
-- Malformed or incomplete reports receive at most one automatic retry. Configuration errors, blocked content, and unclear player selection stop immediately. Failed clips can be retried or have their player selected again without reuploading.
-- Retries keep the original model. The default read-inactivity timeout is 60 seconds (`GEMINI_READ_TIMEOUT`, constrained to 10-120); this is not an end-to-end deadline. Provider `Retry-After` delays longer than ten minutes pause automatic recovery. Each clip has a six-request lifetime cap, including manual retries.
-- Identical uploads reuse a completed report only within the same account, with the exact player selection, model, prompt, schema, and scoring implementation. No video is retained for this cache. Deleted source reports are excluded; older uploads without fingerprints are not reused across uploads. Concurrent duplicates can still incur separate requests when provider concurrency exceeds one.
-- The full upload expires immediately after successful analysis; opted-in report frames and replays remain until report deletion. Abandoned, failed, or waiting uploads expire after 24 hours without updates. A delayed job can be canceled and deleted.
-
-### Analysis diagnostics
-
-Run locally as the owner; this command is read-only and prints aggregate request outcomes, failure codes, latency, and cooldowns without user details or keys:
-
-```sh
-.venv/bin/python -m duprvision.diagnostics
+```dotenv
+ANALYSIS_ENGINE=self_hosted
+SELF_HOSTED_VLM_URL=http://127.0.0.1:8000/v1
+SELF_HOSTED_VLM_MODEL=your-video-model
+SELF_HOSTED_VLM_REVISION=1
 ```
 
-Compare saved JSON reports for **the same clip and player**, optionally against human-reviewed shot labels:
+The server must support the OpenAI-compatible chat-completions protocol with base64 MP4 `video_url`, image input, and JSON-schema output. This uses HTTP directly; the OpenAI SDK and an OpenAI account are not required.
+
+DUPRVision does not bundle or start the model server. Set `SELF_HOSTED_VLM_TOKEN` when the endpoint requires authentication. Increment the revision after changing model weights or inference settings. No self-hosted model is certified here as an accuracy-equivalent replacement.
+
+[Analysis configuration and recovery](docs/analysis.md) · [Local-model research](docs/local-analysis.md)
+
+## Data and Privacy
+
+| Data | Default location and lifetime |
+| --- | --- |
+| Accounts, sessions, follows, events, reports | `data/duprvision.sqlite3`; persisted locally |
+| Original and normalized uploads | `data/uploads/`; deleted after successful review |
+| Abandoned or failed media | Expires after 24 hours without updates |
+| Opted-in frames and short replays | `data/evidence/`; retained until report deletion |
+| Full-video browser playback | Local file reference; cleared on sign-out, replacement, or reload |
+
+Videos, replays, email, and private notes are owner-only. Discoverability exposes the player's name, activity, and social counts to signed-in members. Round-robin invitations grant event membership separately from ordinary follower visibility.
+
+Set `DUPRVISION_DATA_DIR` before starting the app to use another storage directory. Keep that directory and `.env` out of Git. Use only footage you have permission to process and publish.
+
+## Deployment
+
+The current architecture is **one API process, one bounded-concurrency worker process, SQLite, and local media storage**. It suits development and small controlled deployments; this cleanup does not make it a multi-tenant service ready for unrestricted public traffic.
+
+For an always-on deployment, run the API and worker on an always-on host with persistent storage, supervised restarts, HTTPS, backups, and monitoring. A Cloudflare Worker can proxy the app, but it does not run the Python worker or replace the origin server.
+
+`./scripts/share.sh` creates a temporary tunnel. The machine behind it must stay awake and online. The optional `cloudflare/` proxy and `scripts/public.py` support a stable Worker address; account-specific configuration is intentionally ignored by Git.
+
+Before an unrestricted public launch, add account verification/recovery, stronger abuse controls, operational alerting, tested backup restoration, and a privacy/retention review. Move beyond SQLite and local media before deploying multiple hosts. Model accuracy also needs evaluation against human-reviewed pickleball footage.
+
+[Operations and deployment checklist](docs/operations.md) · [Scaling architecture](docs/architecture.md)
+
+## Development
+
+Install development tools separately:
 
 ```sh
-.venv/bin/python -m duprvision.evaluate run-1.json run-2.json --labels labels.json
+.venv/bin/python -m pip install -r requirements-dev.txt
+npm ci
 ```
 
-The label format is `{"shots":[{"timestamp":12.5,"shot_type":"drive"}]}`. Use a complete manually checked shot list, not model-generated labels. The evaluator reports score spread, request latency, one-to-one event precision/recall within one second, and shot-type agreement on matched events. It makes no API calls. Successful report files omit failed-attempt latency; use diagnostics for operational failures. Cached reports are useful for reuse tests, not for measuring model repeatability. No labeled accuracy benchmark is bundled yet.
-
-## Sharing
-
-`./scripts/share.sh` opens a temporary Cloudflare Tunnel to the running local server. Your computer must remain awake and online. Registration is open; this small-group app has no email verification, account recovery, or moderation. Share the URL only with trusted testers.
-
-The optional `cloudflare/worker.mjs` keeps a stable Workers address in front of a changing tunnel. Copy `cloudflare/wrangler.example.jsonc` to `cloudflare/wrangler.jsonc`, configure your Cloudflare account and origin, and deploy with Wrangler. The example config is safe to commit; your account-specific config is ignored. A server that stays online is needed for uptime when your laptop is off.
-
-## Tests
+Run backend checks and the edge-proxy tests:
 
 ```sh
 .venv/bin/python -m pytest -q
-node --check static/app.js
-node --test cloudflare/worker.test.mjs
+.venv/bin/ruff check duprvision scripts tests
+npm run test:edge
 ```
 
-The optional `tests/practice_ui.mjs` browser test expects Playwright, Chrome, a disposable server seeded with `tests/ui_fixture.py`, and `DUPRVISION_REPLAY_FIXTURE` pointing to a playable short MP4. It checks file matching, timestamp seeking, slow motion, note persistence, no replay uploads, cleanup, and 320/390/1440px layouts. Never seed UI fixtures in the normal app database.
+Browser tests use Playwright and a **disposable database**, never your normal app data:
 
-The YOLO26 weights are subject to Ultralytics' licensing. Review its terms before redistribution or commercial use.
+```sh
+PYTHONPATH=. DUPRVISION_DATA_DIR=/tmp/duprvision-ui .venv/bin/python tests/ui_fixture.py
+DUPRVISION_DATA_DIR=/tmp/duprvision-ui .venv/bin/python -m uvicorn duprvision.app:app --port 3017
+```
+
+In another terminal, run `npm run test:ui`. Tests default to installed Google Chrome on macOS; set `CHROME_PATH` to your browser executable on other systems. Additional suites cover selection, replay, maps, social connections, and round robins.
+
+[Testing and demo recording](docs/development.md)
+
+### Repository Map
+
+```text
+duprvision/    API, accounts, jobs, tracking, review, scoring, and events
+static/        Browser interface, styles, icons, and vendored map library
+tests/         Backend tests, browser workflows, and isolated fixtures
+scripts/       Local startup, sharing, diagnostics probe, and demo recorder
+cloudflare/    Optional edge proxy, tests, and example configuration
+docs/          Demo, scoring, operations, architecture, and research notes
+```
+
+Runtime dependencies are in `requirements.txt`; test/lint tools are in `requirements-dev.txt`. Node is for development and optional Cloudflare tooling, not the Python app runtime.
+
+## License
+
+Application source is licensed under [AGPL-3.0](LICENSE). YOLO weights, Leaflet, icons, model weights, and gameplay footage retain their respective terms. Third-party notices are kept beside vendored assets. Review the applicable licenses before redistribution or commercial deployment.

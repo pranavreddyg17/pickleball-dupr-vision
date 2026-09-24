@@ -2,7 +2,7 @@ import json
 from datetime import timedelta
 
 from duprvision import core, worker
-from test_flow import clients, add_result
+from test_flow import add_result
 
 
 def scored_day(uid, name, days_ago, score, key=None):
@@ -96,19 +96,16 @@ def test_tracking_failure_does_not_discard_completed_review(clients, monkeypatch
     assert not core.video_dir('snapshot-failure').exists()
 
 
-def test_progress_daily_comparison_and_account_scope(clients):
+def test_score_history_daily_average_and_account_scope(clients):
     a, b = clients
     uid = a.get('/api/me').json()['id']
     for day in range(10):
         scored_day(uid, f'day-{day}', day, 80 if day < 5 else 60)
-    progress = a.get('/api/progress').json()
-    assert progress['recent_days'] == progress['previous_days'] == 5
-    score, control, balance, recovery = progress['metrics']
-    assert score['value'] == 80 and score['delta'] == 20
-    assert control['delta'] == 20
-    assert balance['value'] is None and balance['delta'] is None
-    assert recovery['delta'] == 0
-    assert b.get('/api/progress').json()['days'] == []
+    history = a.get('/api/scores').json()
+    assert history['scored_days'] == 10
+    assert history['average'] == 70
+    assert b.get('/api/scores').json()['days'] == []
+    assert a.get('/api/progress').status_code == 404
 
 
 def test_progress_duplicates_versions_and_small_samples(clients):
@@ -122,12 +119,11 @@ def test_progress_duplicates_versions_and_small_samples(clients):
         row = db.execute("SELECT result_json FROM analyses WHERE video_id='future-rubric'").fetchone()
         result = json.loads(row[0]); result['performance']['version'] = 'different-rubric'
         db.execute("UPDATE analyses SET result_json=? WHERE video_id='future-rubric'", (json.dumps(result),))
-    progress = a.get('/api/progress').json()
-    assert len(progress['days']) == 1
-    assert progress['metrics'][0]['value'] == 80
-    assert progress['metrics'][0]['delta'] is None
+    history = a.get('/api/scores').json()
+    assert history['scored_days'] == 1
+    assert history['average'] == 80
     a.delete('/api/videos/original')
-    assert len(a.get('/api/progress').json()['days']) == 2
+    assert a.get('/api/scores').json()['scored_days'] == 2
 
 
 def test_original_fingerprint_is_owner_only(clients):

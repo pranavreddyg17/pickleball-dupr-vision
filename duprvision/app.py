@@ -7,20 +7,21 @@ import shutil
 import subprocess
 import uuid
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 from argon2.exceptions import VerifyMismatchError
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from .review import configured_engine
-from .progress import progress_history
+from .schedule import PlayingEvent, visible_events, save_place
+from .places import PlaceSearch, search_places
 
 from .core import (
-    COOKIE, DATA, DB, MAX_DURATION, MAX_SIZE, MAX_UPLOADS,
-    PASSWORD_HASHER, ROOT, aggregate, cleanup_media, cleanup_tmp, connect, create_session,
+    COOKIE, DATA, MAX_DURATION, MAX_SIZE, MAX_UPLOADS,
+    PASSWORD_HASHER, ROOT, cleanup_media, cleanup_tmp, connect, create_session,
     evidence_dir, hash_token, init_db, iso, now, public_video, quota, score_history, user_for_token, video_dir,
 )
 
@@ -70,13 +71,6 @@ class ReportIssue(BaseModel):
     timestamp_seconds: float | None = Field(default=None, ge=0)
 
 
-@app.get('/api/progress')
-def progress(request: Request):
-    user = require_user(request)
-    with connect() as db:
-        return progress_history(db, user['id'])
-
-
 def require_user(request):
     user = user_for_token(request.cookies.get(COOKIE))
     if not user:
@@ -91,6 +85,10 @@ def check_origin(request):
         parsed = urlparse(origin)
         if parsed.netloc != request.headers.get("host") or parsed.scheme not in ("http", "https"):
             raise HTTPException(403, "Invalid request origin")
+
+
+from .competition import router as competition_router
+app.include_router(competition_router(require_user, check_origin))
 
 
 def set_cookie(response, request, token):
@@ -202,12 +200,14 @@ def player_summary(db, target_id, viewer_id, include_history=False):
         raise HTTPException(404, "Player not found")
     history = score_history(db, target_id)
     result = {**dict(row), "average": history["average"], "clips": history["clips"],
-              "latest": history["days"][-1] if history["days"] else None,
+              "score_version": history['kind'],
+              "latest": next((day for day in reversed(history['days']) if day['score'] is not None), None),
               "is_following": bool(db.execute("SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?", (viewer_id, target_id)).fetchone()),
               "followers": db.execute("SELECT COUNT(*) FROM follows WHERE followed_id=?", (target_id,)).fetchone()[0],
               "following": db.execute("SELECT COUNT(*) FROM follows WHERE follower_id=?", (target_id,)).fetchone()[0]}
     if include_history:
         result["history"] = history
+        result['playing'] = visible_events(db, viewer_id, now(), now() + timedelta(days=90), player_id=target_id)['events'][:5]
     if target_id == viewer_id:
         result['connections'] = db.execute("""SELECT COUNT(*) FROM users u JOIN profile_settings p ON p.user_id=u.id
             WHERE p.discoverable=1 AND u.id!=? AND EXISTS(SELECT 1 FROM follows f
@@ -263,6 +263,80 @@ def unfollow(request: Request, player_id: str):
     with connect() as db:
         db.execute("DELETE FROM follows WHERE follower_id=? AND followed_id=?", (user["id"], player_id))
     return {"ok": True}
+
+
+@app.post('/api/places/search')
+def places_search(body: PlaceSearch, request: Request, response: Response):
+    check_origin(request)
+    require_user(request)
+    response.headers['Cache-Control'] = 'private, no-store'
+    return search_places(body)
+
+
+@app.get('/api/places/recent')
+def recent_places(request: Request, response: Response):
+    user = require_user(request)
+    response.headers['Cache-Control'] = 'private, no-store'
+    with connect() as db:
+        rows = db.execute('''SELECT e.location,e.address,p.latitude,p.longitude,MAX(e.updated_at) AS recent
+            FROM playing_events e LEFT JOIN playing_event_places p ON p.event_id=e.id
+            WHERE e.user_id=? GROUP BY e.location,e.address,p.latitude,p.longitude
+            ORDER BY recent DESC LIMIT 6''', (user['id'],)).fetchall()
+    return {'places': [dict(row) for row in rows]}
+
+
+@app.get('/api/schedule')
+def schedule(request: Request, response: Response, start: datetime, end: datetime, view: str = 'all'):
+    user = require_user(request)
+    response.headers['Cache-Control'] = 'private, no-store'
+    with connect() as db:
+        return visible_events(db, user['id'], start, end, view)
+
+
+@app.post('/api/schedule')
+def create_playing_event(body: PlayingEvent, request: Request):
+    check_origin(request)
+    user = require_user(request)
+    values = body.values()
+    event_id = str(uuid.uuid4())
+    with connect(immediate=True) as db:
+        count = db.execute('SELECT COUNT(*) FROM playing_events WHERE user_id=? AND ends_at>?',
+                           (user['id'], iso())).fetchone()[0]
+        if count >= 100:
+            raise HTTPException(400, 'You can keep up to 100 upcoming plans')
+        db.execute('INSERT INTO playing_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                   (event_id, user['id'], *values, iso(), iso()))
+        save_place(db, event_id, body)
+    return {'id': event_id}
+
+
+@app.put('/api/schedule/{event_id}')
+def update_playing_event(event_id: str, body: PlayingEvent, request: Request):
+    check_origin(request)
+    user = require_user(request)
+    values = body.values()
+    with connect(immediate=True) as db:
+        if db.execute('SELECT 1 FROM competitions WHERE event_id=?', (event_id,)).fetchone():
+            raise HTTPException(400, 'Manage this event from its round robin page')
+        changed = db.execute('''UPDATE playing_events SET kind=?,location=?,address=?,starts_at=?,ends_at=?,
+            timezone=?,visibility=?,note=?,updated_at=? WHERE id=? AND user_id=?''',
+            (*values, iso(), event_id, user['id'])).rowcount
+        if not changed:
+            raise HTTPException(404, 'Plan not found')
+        save_place(db, event_id, body)
+    return {'ok': True}
+
+
+@app.delete('/api/schedule/{event_id}')
+def delete_playing_event(event_id: str, request: Request):
+    check_origin(request)
+    user = require_user(request)
+    with connect(immediate=True) as db:
+        if db.execute('SELECT 1 FROM competitions WHERE event_id=?', (event_id,)).fetchone():
+            raise HTTPException(400, 'Finish this event from its round robin page; results are retained')
+        if not db.execute('DELETE FROM playing_events WHERE id=? AND user_id=?', (event_id, user['id'])).rowcount:
+            raise HTTPException(404, 'Plan not found')
+    return {'ok': True}
 
 
 @app.post("/api/videos")
@@ -446,11 +520,14 @@ def select(request: Request, video_id: str, body: Selection):
     if not body.consent:
         raise HTTPException(400, "Consent is required before analysis")
     engine = configured_engine()
-    if engine == "gemini":
+    if engine == 'gemini':
         if not os.getenv("GEMINI_API_KEY"):
             raise HTTPException(503, "Video review is unavailable until the owner completes provider setup")
         if not body.external_consent:
             raise HTTPException(400, "Consent to send this clip to Google for video review is required")
+    if engine == 'self_hosted' and not (os.getenv('SELF_HOSTED_VLM_URL', '').rstrip('/').endswith('/v1')
+                                        and os.getenv('SELF_HOSTED_VLM_MODEL')):
+        raise HTTPException(503, 'Video review is awaiting owner configuration')
     if body.timestamp_seconds > row["duration_seconds"]:
         raise HTTPException(400, "Selection is outside this video")
     with connect(immediate=True) as db:
@@ -464,7 +541,9 @@ def select(request: Request, video_id: str, body: Selection):
                    (video_id, engine, int(body.external_consent)))
         db.execute("INSERT OR REPLACE INTO evidence_preferences(video_id,enabled,keep_clips) VALUES (?,?,?)",
                    (video_id, int(body.save_evidence), int(body.save_evidence and body.save_clips)))
-        db.execute("INSERT OR REPLACE INTO analysis_jobs(video_id,model) VALUES (?,?)", (video_id, os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")))
+        model = (f"self_hosted:{os.getenv('SELF_HOSTED_VLM_MODEL')}:{os.getenv('SELF_HOSTED_VLM_REVISION', '1')}"
+                 if engine == 'self_hosted' else os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"))
+        db.execute("INSERT OR REPLACE INTO analysis_jobs(video_id,model) VALUES (?,?)", (video_id, model))
         db.execute("UPDATE users SET consent_at=COALESCE(consent_at,?) WHERE id=?", (iso(), row["user_id"]))
         db.execute("UPDATE videos SET status='QUEUED', stage='Waiting for analysis', updated_at=? WHERE id=?", (iso(), video_id))
     return {"ok": True}
@@ -473,7 +552,7 @@ def select(request: Request, video_id: str, body: Selection):
 @app.delete("/api/videos/{video_id}")
 def delete_video(request: Request, video_id: str):
     check_origin(request)
-    row = owned_video(request, video_id)
+    owned_video(request, video_id)
     with connect(immediate=True) as db:
         current = db.execute("SELECT status FROM videos WHERE id=?", (video_id,)).fetchone()
         if current[0] in ("PROCESSING", "PREPARING", "QUEUED", "ANALYZING"):
@@ -536,17 +615,6 @@ def tracking_frame(request: Request, video_id: str, number: int):
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
 
 
-@app.get("/api/estimate")
-def estimate(request: Request):
-    user = require_user(request)
-    with connect() as db:
-        rows = db.execute("""SELECT analyses.result_json, videos.duration_seconds FROM analyses
-          JOIN videos ON videos.id=analyses.video_id WHERE videos.user_id=? AND videos.status='COMPLETED'
-          ORDER BY videos.created_at DESC""", (user["id"],)).fetchall()
-    results = [{**json.loads(row["result_json"]), "duration_seconds": row["duration_seconds"]} for row in rows]
-    return {"profile": aggregate(results)}
-
-
 @app.get("/api/health")
 def health():
     lock_path = DATA / "worker.lock"
@@ -559,7 +627,10 @@ def health():
             worker_running = False
             fcntl.flock(lock, fcntl.LOCK_UN)
     engine = configured_engine()
-    return {"ok": True, "analysis_configured": engine == "local" or bool(os.getenv("GEMINI_API_KEY")),
+    configured = (engine == 'local' or engine == 'gemini' and bool(os.getenv('GEMINI_API_KEY')) or
+                  engine == 'self_hosted' and bool(os.getenv('SELF_HOSTED_VLM_URL', '').rstrip('/').endswith('/v1')
+                                                   and os.getenv('SELF_HOSTED_VLM_MODEL')))
+    return {"ok": True, "analysis_configured": configured,
             "analysis_engine": engine, "worker_running": worker_running}
 
 
@@ -570,13 +641,23 @@ def index():
 
 @app.get("/{asset}")
 def asset(asset: str):
-    if asset not in ("app.js", "style.css", "court.png"):
+    if asset not in ("app.js", "navigation.js", "workspace.css", "analyze.js", "analyze.css", "schedule.js", "schedule.css", "competition.js", "competition.css", "places.js", "style.css",
+                     "manifest.webmanifest", "app-icon-192.png", "app-icon-512.png"):
         raise HTTPException(404)
-    return FileResponse(STATIC / asset, headers={"Cache-Control": "no-cache"})
+    media_type = "application/manifest+json" if asset == "manifest.webmanifest" else None
+    return FileResponse(STATIC / asset, media_type=media_type, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/icons/{name}.svg")
 def icon(name: str):
-    if name not in ("house", "circle-plus", "history", "user-round", "users-round", "search", "upload", "arrow-left", "trash-2"):
+    if name not in ("search", "upload", "arrow-left", "trash-2"):
         raise HTTPException(404)
     return FileResponse(STATIC / "icons" / f"{name}.svg", media_type="image/svg+xml")
+
+
+@app.get('/vendor/leaflet/{asset:path}')
+def leaflet_asset(asset: str):
+    if asset not in ('leaflet.js', 'leaflet.css', 'images/marker-icon.png',
+                     'images/marker-icon-2x.png', 'images/marker-shadow.png'):
+        raise HTTPException(404)
+    return FileResponse(STATIC / 'vendor' / 'leaflet' / asset, headers={'Cache-Control': 'public, max-age=86400'})

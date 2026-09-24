@@ -6,7 +6,7 @@ import pytest
 
 from duprvision import core, review, worker
 from duprvision.evaluate import compare_events, summarize
-from test_flow import clients, add_result
+from test_flow import add_result
 from test_reliability import prepare_provider, success
 
 

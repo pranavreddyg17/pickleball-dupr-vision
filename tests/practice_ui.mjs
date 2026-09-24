@@ -43,9 +43,11 @@ try {
   assert.ok(await page.locator('#replay-video').evaluate(v=>v.currentTime)>before,'Background polling must not interrupt playback');
   await page.getByRole('heading',{name:'Key moments'}).waitFor();
   assert.equal(await page.locator('.evidence-item img').first().evaluate(img=>img.complete&&img.naturalWidth>0),true);
-  await page.getByRole('button',{name:'About this score'}).click();
-  await page.getByRole('dialog',{name:'About this score'}).waitFor();
-  await page.getByRole('dialog',{name:'About this score'}).getByRole('button',{name:'Close'}).click();
+  await page.getByRole('button',{name:'Breakdown',exact:true}).click();
+  await page.getByRole('button',{name:/Scoring method/}).click();
+  await page.getByRole('dialog',{name:'Scoring method'}).waitFor();
+  await page.getByRole('dialog',{name:'Scoring method'}).getByRole('button',{name:'Close'}).click();
+  await page.getByRole('button',{name:'Review',exact:true}).click();
   await page.getByRole('button',{name:/^(Add a note|Edit)$/}).click();
   await page.locator('#session-note').fill('Practice resets. <script>not markup</script>');
   await page.getByText('Saved',{exact:true}).waitFor();
@@ -63,7 +65,6 @@ try {
     await page.screenshot({path:`/tmp/duprvision-shot-review-${width}.png`,fullPage:true});
   }
   await page.reload();
-  await page.locator('.session-row[data-video="qa-local-0"]').click();
   await page.getByRole('button',{name:'Edit',exact:true}).click();
   assert.equal(await page.locator('#session-note').inputValue(),'Practice resets. <script>not markup</script>');
   await page.getByRole('button',{name:'Done'}).click();

@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from duprvision import core
 
-if not os.environ.get("DUPRVISION_DATA_DIR") or core.DATA == core.ROOT / "data":
+if not os.environ.get("DUPRVISION_DATA_DIR") or core.DATA.resolve() == (core.ROOT / "data").resolve():
     raise SystemExit("Set DUPRVISION_DATA_DIR to a disposable directory")
 core.init_db()
 with core.connect() as db:

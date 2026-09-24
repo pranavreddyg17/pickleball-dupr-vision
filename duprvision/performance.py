@@ -45,7 +45,11 @@ recording limitation. No rating, Markdown, invented statistics, or timecodes in 
 List visible selected-player shots, at most the first 40; do not fill gaps or invent contacts.
 Use seconds for timestamps. Segment at most 12 rallies, excluding pauses. Label a drive/drop
 only from visible ball trajectory, not arm motion. A dink lands in the kitchen, not the baseline.
-If ball trajectory is unclear set ball_visible=false. For each shot assess:
+Assess visibility from the actual footage, not frame dimensions. ball_visible=true means
+some selected-player contacts and trajectories are visible; occasional blur or occlusion
+does not invalidate other clear shots. Use low confidence and unknown/null for those unclear
+events. Set ball_visible=false only when no usable selected-player ball evidence exists.
+For each shot assess:
 control: controlled = visibly purposeful placement or effective reset/attack; neutral = kept
 play neutral without clear placement quality; error = visible net/out or clearly attackable
 miss-hit; unknown = outcome/trajectory not visible. Never assume kept-in-play means controlled.
@@ -78,25 +82,48 @@ def validate_performance(raw, duration):
         "Balance": [int(s.balanced) for s in reliable if s.balanced is not None],
         "Recovery": [int(s.recovered) for s in reliable if s.recovered is not None],
     }
+    by_type = {}
+    for shot in reliable:
+        if shot.control != 'unknown':
+            by_type.setdefault(shot.shot_type, Counter())[shot.control] += 1
+    shot_breakdown = [{'type': shot_type, 'assessed': sum(counts.values()),
+                       'controlled': counts['controlled'], 'neutral': counts['neutral'],
+                       'errors': counts['error']}
+                      for shot_type, counts in sorted(by_type.items(),
+                                                     key=lambda item: (-sum(item[1].values()), item[0]))]
     components = [{"name":name, "value":round(100*sum(v)/len(v),1) if v else None,
                    "observations":len(v), "weight":weight}
                   for (name,v),weight in zip(values.items(), (.5,.25,.25))]
-    sufficient = (len(reliable) >= 4 and reliable[-1].timestamp-reliable[0].timestamp >= 5
+    sufficient = (len(reliable) >= 3 and reliable[-1].timestamp-reliable[0].timestamp >= 5
                   and all(c["observations"] >= 3 for c in components))
     # Fixed arithmetic on stored observations. Never ask the model to invent the score.
     score = int(sum(c["value"]*c["weight"] for c in components)+.5) if sufficient else None
+    if sufficient:
+        note = (f'Short sample: {len(reliable)} assessed shots.' if len(reliable) < 8 else
+                'AI-assessed clip performance, not a DUPR rating.')
+    elif not review.ball_visible:
+        note = 'No clear selected-player ball contacts were identified in this clip.'
+    elif len(reliable) < 3:
+        note = f'{len(reliable)} assessed contact' + ('s' if len(reliable) != 1 else '') + '. At least 3 are needed for a session score.'
+    elif reliable[-1].timestamp - reliable[0].timestamp < 5:
+        note = 'The assessed contacts cover less than five seconds of play.'
+    else:
+        note = 'More visible shot outcomes, balance or recovery observations are needed for a session score.'
     if not review.ball_visible:
         for s in shots:
             s.shot_type, s.confidence, s.control = "unknown", "low", "unknown"
             s.balanced = s.recovered = None
     from .review import valid_coaching_note
     return {"kind":"video_review_v2", "summary":review.summary,
+            "subject_identified":review.subject_identified, "ball_visible":review.ball_visible,
             "priority":review.priority if valid_coaching_note(review.priority, duration) else "",
             "recording_note":review.recording_note, "shots":[s.model_dump() for s in shots],
             "rallies":[r.model_dump() for r in rallies],
             "shot_counts":dict(Counter(s.shot_type for s in reliable)),
+            "shot_breakdown":shot_breakdown,
             "uncertain_shots":len(shots)-len(reliable),
             "performance":{"version":"vision_score_v1", "score":score, "components":components,
+                           "eligibility_version":"contacts_v2",
+                           "sample_scope":"short" if len(reliable) < 8 else "standard",
                            "observed_shots":len(reliable),
-                           "note":"AI-assessed clip performance, not a DUPR rating." if sufficient else
-                           "More clear contacts and visible footwork are needed for a score."}}
+                           "note":note}}

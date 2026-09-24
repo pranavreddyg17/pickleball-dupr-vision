@@ -1,0 +1,15 @@
+{
+  "name": "duprvision-dev-tools",
+  "private": true,
+  "scripts": {
+    "test:edge": "node --test cloudflare/worker.test.mjs",
+    "test:ui": "node tests/navigation_ui.mjs",
+    "demo": "node scripts/record_demo.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
