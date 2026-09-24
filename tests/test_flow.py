@@ -305,14 +305,41 @@ def compact_assessment():
     return raw
 
 
-def test_gemini_requires_owner_opt_in_and_uploader_consent(monkeypatch):
+def test_gemini_requires_owner_opt_in_and_uploader_consent(monkeypatch, tmp_path):
     from duprvision.review import gemini_review
+    monkeypatch.setattr(core, "DATA", tmp_path)
+    monkeypatch.setattr(core, "DB", tmp_path / "uninitialized.sqlite3")
     monkeypatch.setenv("ANALYSIS_ENGINE","local")
     with pytest.raises(RuntimeError,match="authorized"):
         gemini_review({}, {}, True)
     monkeypatch.setenv("ANALYSIS_ENGINE","gemini")
     with pytest.raises(RuntimeError,match="authorized"):
         gemini_review({}, {}, False)
+    assert not core.DB.exists(), "Invalid authorization must not access the database"
+
+
+@pytest.mark.parametrize('saved_engine,consent,allowed', [
+    (None, False, False), ('local', True, False),
+    ('gemini', False, False), ('gemini', True, True),
+])
+def test_gemini_saved_authorization_after_engine_change(clients, monkeypatch, saved_engine, consent, allowed):
+    from duprvision.review import gemini_review
+    client, _ = clients
+    uid = client.get('/api/me').json()['id']
+    add_result(uid, 'saved-authorization', None, core.iso())
+    cached = {'kind': 'video_review_v2', 'summary': 'Cached test report'}
+    with core.connect() as db:
+        if saved_engine:
+            db.execute('INSERT INTO analysis_options VALUES (?,?,?)',
+                       ('saved-authorization', saved_engine, int(consent)))
+        db.execute('INSERT INTO provider_results VALUES (?,?)',
+                   ('saved-authorization', json.dumps(cached)))
+    monkeypatch.setenv('ANALYSIS_ENGINE', 'local')
+    if allowed:
+        assert gemini_review({'id': 'saved-authorization'}, {}, True) == cached
+    else:
+        with pytest.raises(RuntimeError, match='authorized'):
+            gemini_review({'id': 'saved-authorization'}, {}, True)
 
 
 @pytest.mark.parametrize("model", ["gemini-2.5-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"])

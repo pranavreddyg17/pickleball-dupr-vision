@@ -69,7 +69,7 @@ def cache_key(db, video_id, selection, model, marked=False, tracked=False, backe
 
 
 def gemini_review(row, selection, external_consent, marked_reference=None, tracked=None):
-    if not external_consent:
+    if not external_consent or not row.get("id"):
         raise RuntimeError("External video processing has not been authorized")
     if configured_engine() != "gemini":
         with connect() as db:
